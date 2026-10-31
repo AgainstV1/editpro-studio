@@ -120,6 +120,7 @@ Actively used, but early. Worth knowing before relying on it:
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md) — what changed in each version
+- [docs/ASSISTANT.md](docs/ASSISTANT.md) — the built-in editing assistant, with your own API key
 - [docs/MCP.md](docs/MCP.md) — letting an AI agent read and edit the project over MCP
 - [docs/TUNNEL.md](docs/TUNNEL.md) — reaching the MCP server from a cloud agent through a tunnel
 - [docs/MAINTENANCE.md](docs/MAINTENANCE.md) — verification notes, manual test checklist,

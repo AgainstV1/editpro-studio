@@ -2,6 +2,22 @@
 
 All notable changes to Edit Pro Studio (Android). Newest first.
 
+## 2.8.0 — unreleased
+
+### Added
+- **Built-in editing assistant (bring your own key).** A chat panel that drives the same tools as
+  the MCP server, but by calling the model directly from the app — no tunnel, no exposed port, no
+  Termux. Works with any OpenAI-compatible endpoint (OpenAI, Gemini, OpenRouter, Groq, DeepSeek,
+  Mistral, Ollama and friends). See [docs/ASSISTANT.md](docs/ASSISTANT.md).
+- The API key is encrypted with a hardware-backed Android Keystore key; only ciphertext reaches
+  preferences.
+- Cleartext HTTP is permitted to 127.0.0.1 only, so a local model server works without weakening
+  anything else.
+
+### Changed
+- **MCP is now opt-in** (default off). The built-in assistant is the normal path; turning the
+  socket on is the user's choice and their responsibility to run and secure.
+
 ## 2.7.0 — unreleased
 
 ### Added
