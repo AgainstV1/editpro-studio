@@ -2,6 +2,22 @@
 
 All notable changes to Edit Pro Studio (Android). Newest first.
 
+## 2.7.0 — unreleased
+
+### Added
+- **Tunnel support, and a guide for it.** [docs/TUNNEL.md](docs/TUNNEL.md) walks through exposing
+  the MCP server to a cloud agent with `cloudflared` in Termux. The socket still binds to
+  127.0.0.1 — the tunnel client connects locally, so nothing is exposed on the LAN.
+- **SSE framing.** Clients that advertise `Accept: text/event-stream` now get the response as a
+  single SSE `message` event instead of plain JSON, which unblocks several MCP clients.
+
+### Security
+- **Tokens are now 24 characters** (~120 bits) instead of 8, because the endpoint may face the
+  internet. Shorter legacy tokens are replaced on upgrade.
+- **Constant-time token comparison**, plus a brake that pauses authentication for 30 s after five
+  consecutive failures.
+- Rejected requests are logged with the caller's forwarded IP.
+
 ## 2.6.0 — unreleased
 
 ### Changed

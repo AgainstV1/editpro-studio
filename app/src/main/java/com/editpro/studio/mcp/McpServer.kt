@@ -110,7 +110,9 @@ class McpServer(
             val query = target.substringAfter('?', "")
 
             if (!isAuthorised(headers, query)) {
-                onLog("rejected unauthorised request from ${client.inetAddress.hostAddress}")
+                val origin = headers["x-forwarded-for"]?.substringBefore(',')?.trim()
+                    ?: client.inetAddress.hostAddress
+                onLog("rejected unauthorised request from $origin")
                 writeJson(output, 401, errorBody(null, -32001, "Unauthorised: missing or invalid pairing token"))
                 return
             }
@@ -132,7 +134,14 @@ class McpServer(
                     }
                     val body = readBody(input, length)
                     val response = dispatch(body)
-                    if (response == null) writeEmpty(output, 202) else writeJson(output, 200, response)
+                    // MCP Streamable HTTP clients often advertise text/event-stream; answer in SSE
+                    // framing when they do, otherwise plain JSON. Same payload either way.
+                    val wantsSse = headers["accept"].orEmpty().contains("text/event-stream")
+                    when {
+                        response == null -> writeEmpty(output, 202)
+                        wantsSse -> writeSse(output, response)
+                        else -> writeJson(output, 200, response)
+                    }
                 }
 
                 path == "/mcp" && method == "GET" -> writeJson(
@@ -149,13 +158,51 @@ class McpServer(
         }
     }
 
+    @Volatile
+    private var lockedUntilMs = 0L
+    private val recentFailures = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
+     * Token check with a brute-force brake. Once the endpoint is reachable through a tunnel the
+     * token is the only thing guarding the project, so repeated wrong guesses earn a short lockout
+     * and every comparison is constant-time.
+     */
     private fun isAuthorised(headers: Map<String, String>, query: String): Boolean {
         if (token.isEmpty()) return true
-        val bearer = headers["authorization"]?.removePrefix("Bearer ")?.removePrefix("bearer ")?.trim()
-        if (bearer == token) return true
-        return query.split("&")
+        val now = System.currentTimeMillis()
+        if (now < lockedUntilMs) return false
+
+        val bearer = headers["authorization"]
+            ?.removePrefix("Bearer ")
+            ?.removePrefix("bearer ")
+            ?.trim()
+        val fromQuery = query.split("&")
             .firstOrNull { it.startsWith("token=") }
-            ?.substringAfter("token=") == token
+            ?.substringAfter("token=")
+
+        val ok = (bearer != null && constantTimeEquals(bearer, token)) ||
+            (fromQuery != null && constantTimeEquals(fromQuery, token))
+
+        if (ok) {
+            recentFailures.set(0)
+            return true
+        }
+
+        if (recentFailures.incrementAndGet() >= 5) {
+            recentFailures.set(0)
+            lockedUntilMs = now + 30_000L
+            onLog("5 bad tokens - pausing authentication for 30s")
+        }
+        // Slow the caller down a little without blocking the pool.
+        runCatching { Thread.sleep(150) }
+        return false
+    }
+
+    private fun constantTimeEquals(a: String, b: String): Boolean {
+        if (a.length != b.length) return false
+        var diff = 0
+        for (i in a.indices) diff = diff or (a[i].code xor b[i].code)
+        return diff == 0
     }
 
     // -------------------------------------------------------------- JSON-RPC
@@ -247,6 +294,24 @@ class McpServer(
     private fun writeJson(output: OutputStream, status: Int, body: Any) {
         val text = body.toString()
         write(output, status, "application/json", text)
+    }
+
+    private fun writeSse(output: OutputStream, body: Any) {
+        val payload = body.toString().replace("\n", "\ndata: ")
+        val text = buildString {
+            append("HTTP/1.1 200 OK\r\n")
+            append("Content-Type: text/event-stream; charset=utf-8\r\n")
+            append("Cache-Control: no-cache\r\n")
+            append("Access-Control-Allow-Origin: *\r\n")
+            append("Access-Control-Allow-Headers: Authorization, Content-Type, Mcp-Session-Id\r\n")
+            append("Connection: close\r\n\r\n")
+            append("event: message\r\n")
+            append("data: $payload\r\n\r\n")
+        }
+        runCatching {
+            output.write(text.toByteArray(Charsets.UTF_8))
+            output.flush()
+        }
     }
 
     private fun writeEmpty(output: OutputStream, status: Int) {

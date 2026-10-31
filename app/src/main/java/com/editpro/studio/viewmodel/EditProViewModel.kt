@@ -2190,15 +2190,21 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
 
     private fun loadMcpToken() {
         val stored = prefs.getString("mcp_token", null)
-        val token = stored?.takeIf { it.isNotBlank() } ?: generateMcpToken()
+        // Tokens shorter than 16 characters predate tunnel support and are too weak to face the
+        // internet, so they are replaced on upgrade.
+        val token = stored?.takeIf { it.length >= 16 } ?: generateMcpToken()
         if (stored != token) prefs.edit().putString("mcp_token", token).apply()
         val autoStart = prefs.getBoolean("mcp_auto_start", true)
         _uiState.update { it.copy(mcpToken = token, mcpAutoStart = autoStart) }
     }
 
+    /**
+     * 24 characters (~120 bits). Longer than the original 8 because the endpoint may be reachable
+     * through a tunnel, where the token is the only thing guarding the project.
+     */
     private fun generateMcpToken(): String {
         val chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".toList()
-        return (1..8).map { chars.random() }.joinToString("")
+        return (1..24).map { chars.random() }.joinToString("")
     }
 
     private fun appendMcpLog(message: String) {
