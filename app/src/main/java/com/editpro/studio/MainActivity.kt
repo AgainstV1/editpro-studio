@@ -93,6 +93,7 @@ import com.editpro.studio.model.WorkspaceMode
 import com.editpro.studio.model.formatFileSize
 import com.editpro.studio.model.formatTimecode
 import com.editpro.studio.ui.AgentAccessDialog
+import com.editpro.studio.ui.AgentChatDialog
 import com.editpro.studio.ui.AlertSheetDialog
 import com.editpro.studio.ui.ClipMenuSettingsDialog
 import com.editpro.studio.ui.ConfirmDialog
@@ -308,6 +309,7 @@ fun EditProWorkspaceScreen(
     val rootFocus = remember { FocusRequester() }
     val anyDialogOpen = state.showExportModal || state.showToolsModal || state.showSolidModal ||
         state.showPresetsModal || state.showShortcutsModal || state.showClipMenuModal || showAgentAccess ||
+        state.showAgentChat ||
         state.pendingConfirm != null || state.alertTitle != null
     LaunchedEffect(state.showHome, anyDialogOpen) {
         if (!state.showHome && !anyDialogOpen) {
@@ -627,7 +629,8 @@ fun EditProWorkspaceScreen(
                 onToggleFullscreen = toggleFullscreen,
                 onOpenClipMenu = { viewModel.setShowClipMenuModal(true) },
                 onToggleScrubFollow = viewModel::toggleScrubFollow,
-                onOpenAgentAccess = { showAgentAccess = true }
+                onOpenAgentAccess = { showAgentAccess = true },
+                onOpenAgentChat = { viewModel.setShowAgentChat(true) }
             )
         }
 
@@ -652,6 +655,20 @@ fun EditProWorkspaceScreen(
                 onStop = { viewModel.setAgentAccessEnabled(false) },
                 onRegenerate = { viewModel.regenerateMcpToken() },
                 onDismiss = { showAgentAccess = false }
+            )
+        }
+
+        if (state.showAgentChat) {
+            AgentChatDialog(
+                state = state,
+                onSend = viewModel::sendAgentMessage,
+                onStop = viewModel::stopAgent,
+                onClear = viewModel::clearAgentChat,
+                onSetBaseUrl = viewModel::setAgentBaseUrl,
+                onSetModel = viewModel::setAgentModel,
+                onSaveKey = viewModel::saveAgentKey,
+                onClearKey = viewModel::clearAgentKey,
+                onDismiss = { viewModel.setShowAgentChat(false) }
             )
         }
 

@@ -67,6 +67,40 @@ class McpTools(private val viewModel: EditProViewModel) {
         return out
     }
 
+    /** The same tools, shaped for OpenAI-compatible function calling. */
+    fun openAiTools(): JSONArray {
+        val out = JSONArray()
+        specs.forEach { spec ->
+            out.put(
+                JSONObject()
+                    .put("type", "function")
+                    .put(
+                        "function",
+                        JSONObject()
+                            .put("name", spec.name)
+                            .put("description", spec.description)
+                            .put("parameters", spec.schema)
+                    )
+            )
+        }
+        return out
+    }
+
+    /**
+     * Runs a tool and returns its raw result as JSON text. Throws on failure so the in-app agent
+     * loop can hand the error back to the model instead of dying.
+     */
+    fun execute(name: String, args: JSONObject): String {
+        val spec = specs.firstOrNull { it.name == name }
+            ?: throw IllegalArgumentException("Unknown tool '$name'.")
+        val value = if (spec.onMain) {
+            runBlocking(Dispatchers.Main) { spec.handler(args) }
+        } else {
+            spec.handler(args)
+        }
+        return if (value is String) value else value.toString()
+    }
+
     fun call(name: String, args: JSONObject): JSONObject {
         val spec = specs.firstOrNull { it.name == name }
             ?: return errorContent("Unknown tool '$name'. Call tools/list for the available tools.")

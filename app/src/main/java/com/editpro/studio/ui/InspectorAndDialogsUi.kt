@@ -1097,7 +1097,8 @@ fun EditingToolsDialog(
     onToggleFullscreen: () -> Unit,
     onOpenClipMenu: () -> Unit,
     onToggleScrubFollow: () -> Unit,
-    onOpenAgentAccess: () -> Unit
+    onOpenAgentAccess: () -> Unit,
+    onOpenAgentChat: () -> Unit
 ) {
     val palette = LocalEditProPalette.current
     Dialog(onDismissRequest = onDismiss) {
@@ -1132,6 +1133,9 @@ fun EditingToolsDialog(
                 if (state.scrubFollow) "Playhead follows cursor: On (Alt+F)"
                 else "Playhead follows cursor: Off (Alt+F)"
             ) { onToggleScrubFollow() }
+            InspectorActionButton("Editing assistant (bring your own key)") {
+                onDismiss(); onOpenAgentChat()
+            }
             InspectorActionButton(
                 if (state.mcpRunning) "Agent access (MCP): running" else "Agent access (MCP)"
             ) { onDismiss(); onOpenAgentAccess() }

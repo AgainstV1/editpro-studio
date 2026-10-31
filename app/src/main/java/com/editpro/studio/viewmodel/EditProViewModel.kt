@@ -11,6 +11,9 @@ import com.editpro.studio.media.GalleryPublisher
 import com.editpro.studio.media.MediaEngine
 import com.editpro.studio.media.NativeVideoExporter
 import com.editpro.studio.media.PreviewAudioEngine
+import com.editpro.studio.agent.AgentEngine
+import com.editpro.studio.agent.OpenAiClient
+import com.editpro.studio.agent.SecureStore
 import com.editpro.studio.mcp.McpServer
 import com.editpro.studio.mcp.McpService
 import com.editpro.studio.mcp.McpTools
@@ -77,6 +80,9 @@ data class RecentProject(
     val clipCount: Int,
     val durationSec: Double
 )
+
+/** One line in the in-app agent transcript. [role] is user, assistant, tool, toolResult or error. */
+data class AgentMessage(val role: String, val text: String)
 
 data class EditorUiState(
     val projectName: String = "Untitled Project",
@@ -153,8 +159,20 @@ data class EditorUiState(
     val mcpPort: Int = 8765,
     val mcpToken: String = "",
     val mcpLog: List<String> = emptyList(),
-    /** Agent access stays on across launches unless the user turns it off. */
-    val mcpAutoStart: Boolean = true
+    /**
+     * MCP is opt-in: the built-in assistant is the normal path, and anyone exposing a socket is
+     * responsible for running and securing it.
+     */
+    val mcpAutoStart: Boolean = false,
+
+    // Built-in agent (bring your own key)
+    val agentBaseUrl: String = "https://api.openai.com/v1",
+    val agentModel: String = "gpt-4o-mini",
+    val agentHasKey: Boolean = false,
+    val agentRunning: Boolean = false,
+    val agentStatus: String = "",
+    val agentMessages: List<AgentMessage> = emptyList(),
+    val showAgentChat: Boolean = false
 ) {
     val assetsById: Map<String, MediaAsset>
         get() = assets.associateBy { it.id }
@@ -214,12 +232,15 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
     private var exportJob: Job? = null
     private val previewAudio = PreviewAudioEngine()
     private var mcpServer: McpServer? = null
+    private var agentJob: Job? = null
+    private val agentEngine by lazy { AgentEngine(McpTools(this)) }
 
     init {
         loadPersistedPreferences()
         loadRecentProjects()
         loadClipMenu()
         loadMcpToken()
+        loadAgentSettings()
         recoverAutosaveIfPresent()
     }
 
@@ -2130,6 +2151,10 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         prefs.edit().putString("clip_menu_order", order.joinToString(",")).apply()
     }
 
+    private companion object {
+        const val AGENT_KEY = "agent_api_key"
+    }
+
     // -------------------------------------------------------------------------
     // AGENT ACCESS (MCP)
     // -------------------------------------------------------------------------
@@ -2194,7 +2219,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         // internet, so they are replaced on upgrade.
         val token = stored?.takeIf { it.length >= 16 } ?: generateMcpToken()
         if (stored != token) prefs.edit().putString("mcp_token", token).apply()
-        val autoStart = prefs.getBoolean("mcp_auto_start", true)
+        val autoStart = prefs.getBoolean("mcp_auto_start", false)
         _uiState.update { it.copy(mcpToken = token, mcpAutoStart = autoStart) }
     }
 
@@ -2316,6 +2341,139 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         val isPlaying = _uiState.value.isPlaying
         if (playing && !isPlaying) togglePlayPause()
         if (!playing && isPlaying) pausePlayback()
+    }
+
+    // -------------------------------------------------------------------------
+    // BUILT-IN AGENT (bring your own key)
+    // -------------------------------------------------------------------------
+    fun loadAgentSettings() {
+        val baseUrl = prefs.getString("agent_base_url", "https://api.openai.com/v1")
+            ?: "https://api.openai.com/v1"
+        val model = prefs.getString("agent_model", "gpt-4o-mini") ?: "gpt-4o-mini"
+        val hasKey = !SecureStore.get(getApplication(), AGENT_KEY).isNullOrBlank()
+        _uiState.update { it.copy(agentBaseUrl = baseUrl, agentModel = model, agentHasKey = hasKey) }
+    }
+
+    fun setAgentBaseUrl(url: String) {
+        val clean = url.trim()
+        prefs.edit().putString("agent_base_url", clean).apply()
+        _uiState.update { it.copy(agentBaseUrl = clean) }
+    }
+
+    fun setAgentModel(model: String) {
+        val clean = model.trim()
+        prefs.edit().putString("agent_model", clean).apply()
+        _uiState.update { it.copy(agentModel = clean) }
+    }
+
+    fun saveAgentKey(key: String) {
+        val clean = key.trim()
+        if (clean.isEmpty()) return
+        SecureStore.put(getApplication(), AGENT_KEY, clean)
+        _uiState.update { it.copy(agentHasKey = true) }
+        showToast("API key saved securely")
+    }
+
+    fun clearAgentKey() {
+        SecureStore.clear(getApplication(), AGENT_KEY)
+        _uiState.update { it.copy(agentHasKey = false) }
+        showToast("API key removed")
+    }
+
+    fun setShowAgentChat(show: Boolean) {
+        _uiState.update { it.copy(showAgentChat = show) }
+    }
+
+    fun clearAgentChat() {
+        agentEngine.reset()
+        _uiState.update { it.copy(agentMessages = emptyList(), agentStatus = "") }
+    }
+
+    fun stopAgent() {
+        agentJob?.cancel()
+    }
+
+    fun sendAgentMessage(text: String) {
+        val message = text.trim()
+        val state = _uiState.value
+        if (message.isEmpty() || state.agentRunning) return
+
+        if (!state.agentHasKey) {
+            appendAgent("error", "Add an API key in agent settings first.")
+            return
+        }
+        if (state.agentBaseUrl.isBlank() || state.agentModel.isBlank()) {
+            appendAgent("error", "Set the base URL and model name in agent settings first.")
+            return
+        }
+
+        _uiState.update {
+            it.copy(
+                agentMessages = it.agentMessages + AgentMessage("user", message),
+                agentRunning = true,
+                agentStatus = "Thinking..."
+            )
+        }
+
+        val client = OpenAiClient(state.agentBaseUrl, SecureStore.get(getApplication(), AGENT_KEY).orEmpty(), state.agentModel)
+
+        // IO, not Main: tool handlers hop to Main internally, and blocking Main on itself would deadlock.
+        agentJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                agentEngine.send(client, message) { event ->
+                    when (event) {
+                        is AgentEngine.Event.Thinking ->
+                            _uiState.update { st ->
+                                st.copy(agentStatus = if (event.step <= 1) "Thinking..." else "Step ${event.step}...")
+                            }
+                        is AgentEngine.Event.ToolStarted ->
+                            _uiState.update { st ->
+                                st.copy(
+                                    agentStatus = "Running ${event.name}...",
+                                    agentMessages = st.agentMessages + AgentMessage("tool", event.name)
+                                )
+                            }
+                        is AgentEngine.Event.ToolFinished ->
+                            _uiState.update { st ->
+                                st.copy(agentMessages = st.agentMessages + AgentMessage("toolResult", event.summary))
+                            }
+                        is AgentEngine.Event.Assistant ->
+                            _uiState.update { st ->
+                                st.copy(agentMessages = st.agentMessages + AgentMessage("assistant", event.text))
+                            }
+                    }
+                }
+                _uiState.update { it.copy(agentRunning = false, agentStatus = "") }
+            } catch (ce: CancellationException) {
+                withContext(NonCancellable) {
+                    _uiState.update {
+                        it.copy(
+                            agentRunning = false,
+                            agentStatus = "",
+                            agentMessages = it.agentMessages + AgentMessage("error", "Stopped.")
+                        )
+                    }
+                }
+                throw ce
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        agentRunning = false,
+                        agentStatus = "",
+                        agentMessages = it.agentMessages + AgentMessage(
+                            "error",
+                            e.message ?: e.javaClass.simpleName
+                        )
+                    )
+                }
+            } finally {
+                agentJob = null
+            }
+        }
+    }
+
+    private fun appendAgent(role: String, text: String) {
+        _uiState.update { it.copy(agentMessages = it.agentMessages + AgentMessage(role, text)) }
     }
 
     /** Adds an asset produced by a web fetch to the library, ready for add_clip. */
