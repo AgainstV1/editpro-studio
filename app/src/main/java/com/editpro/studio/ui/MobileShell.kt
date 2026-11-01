@@ -18,6 +18,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -32,6 +33,15 @@ fun rememberIsCompact(): Boolean {
     val configuration = LocalConfiguration.current
     return configuration.screenWidthDp < 600 || configuration.screenHeightDp < 480
 }
+
+/**
+ * Caps a dialog at most of the window height.
+ *
+ * Dialogs used fixed maximum heights, which is fine in portrait and clips on a landscape phone
+ * where the window is only about 360dp tall.
+ */
+@Composable
+fun rememberDialogMaxHeight(): Dp = LocalConfiguration.current.screenHeightDp.dp * 0.86f
 
 /** The three workspace panes. A tablet shows them together; a phone shows one at a time. */
 enum class MobilePane(val label: String) {

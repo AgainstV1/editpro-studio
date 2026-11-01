@@ -84,7 +84,7 @@ fun AgentChatDialog(
                 .widthIn(max = 480.dp)
                 .fillMaxWidth()
                 .imePadding()
-                .heightIn(max = 540.dp)
+                .heightIn(max = minOf(540.dp, rememberDialogMaxHeight()))
                 .clip(RoundedCornerShape(16.dp))
                 .background(palette.panel)
                 .border(0.5.dp, palette.line, RoundedCornerShape(16.dp))

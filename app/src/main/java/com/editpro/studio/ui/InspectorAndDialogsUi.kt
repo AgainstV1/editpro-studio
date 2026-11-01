@@ -1156,7 +1156,7 @@ fun EditingToolsDialog(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(max = 560.dp)
+                .heightIn(max = minOf(560.dp, rememberDialogMaxHeight()))
                 .clip(RoundedCornerShape(16.dp))
                 .background(palette.panel)
                 .border(0.5.dp, palette.line, RoundedCornerShape(16.dp))
@@ -1293,7 +1293,7 @@ fun PresetPacksHubDialog(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(max = 580.dp)
+                .heightIn(max = minOf(580.dp, rememberDialogMaxHeight()))
                 .clip(RoundedCornerShape(16.dp))
                 .background(palette.panel)
                 .border(0.5.dp, palette.line, RoundedCornerShape(16.dp))
@@ -1697,7 +1697,7 @@ fun ShortcutsDialog(onDismiss: () -> Unit) {
                 verticalArrangement = Arrangement.spacedBy(4.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 380.dp)
+                    .heightIn(max = minOf(380.dp, rememberDialogMaxHeight()))
                     .verticalScroll(rememberScrollState())
             ) {
                 entries.forEach { (label, keys) ->
