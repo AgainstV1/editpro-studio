@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -50,6 +51,7 @@ import androidx.compose.ui.input.pointer.isPrimaryPressed
 import androidx.compose.ui.input.pointer.isSecondaryPressed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
@@ -135,6 +137,8 @@ fun TimelinePanel(
 ) {
     val palette = LocalEditProPalette.current
     val density = LocalDensity.current
+    // On a phone the toolbar has more controls than fit, so it scrolls instead of clipping.
+    val compact = LocalConfiguration.current.screenWidthDp < 600
 
     Column(
         modifier = modifier
@@ -150,6 +154,7 @@ fun TimelinePanel(
                 .height(44.dp)
                 .background(palette.panel.copy(alpha = 0.9f))
                 .border(0.5.dp, palette.line)
+                .then(if (compact) Modifier.horizontalScroll(rememberScrollState()) else Modifier)
                 .padding(horizontal = 10.dp)
         ) {
             SmileIconButton(icon = SmileIconType.ADD_TEXT, accessibleLabel = "＋ Text", shortcutBadge = "T", onClick = onAddText)
@@ -175,7 +180,7 @@ fun TimelinePanel(
                 modifier = Modifier.padding(start = 4.dp)
             )
 
-            Spacer(modifier = Modifier.weight(1f))
+            if (!compact) Spacer(modifier = Modifier.weight(1f))
 
             Slider(
                 value = state.timelineZoomPxPerSec.toFloat().coerceIn(5f, 180f),

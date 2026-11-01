@@ -29,7 +29,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
@@ -71,6 +73,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -96,6 +99,8 @@ import com.editpro.studio.model.formatTimecode
 import com.editpro.studio.ui.AgentAccessDialog
 import com.editpro.studio.ui.AgentChatDialog
 import com.editpro.studio.ui.AlertSheetDialog
+import com.editpro.studio.ui.MobilePane
+import com.editpro.studio.ui.MobilePaneSwitcher
 import com.editpro.studio.ui.ClipMenuSettingsDialog
 import com.editpro.studio.ui.ConfirmDialog
 import com.editpro.studio.ui.EditProStudioTheme
@@ -163,6 +168,10 @@ fun EditProWorkspaceScreen(
     var dragPosition by remember { mutableStateOf(Offset.Zero) }
     var timelineGeometry by remember { mutableStateOf<TimelineDropGeometry?>(null) }
     var showAgentAccess by remember { mutableStateOf(false) }
+
+    // Phone vs tablet. Drives the workspace (three panes or one) and the header (scrollable).
+    val isCompact = LocalConfiguration.current.screenWidthDp < 600
+    var mobilePane by remember { mutableStateOf(MobilePane.Preview) }
 
     // Native Android Storage Access Framework Launchers
     val mediaPickerLauncher = rememberLauncherForActivityResult(
@@ -412,15 +421,25 @@ fun EditProWorkspaceScreen(
                     if (viewModel.hasWorkToDiscard()) viewModel.requestConfirm(PendingConfirm.OPEN_PROJECT)
                     else openProjectLauncher.launch(arrayOf("*/*"))
                 },
-                onOpenExport = { viewModel.setShowExportModal(true) }
+                onOpenExport = { viewModel.setShowExportModal(true) },
+                compact = isCompact
             )
 
-            // Main 3-Pane Split Workspace (Media Library | Preview Center | 5-Tab Inspector)
-            Row(
+            // Workspace: three panes side by side on a tablet, one at a time on a phone.
+            Column(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
             ) {
+                if (isCompact) {
+                    MobilePaneSwitcher(active = mobilePane, onSelect = { mobilePane = it })
+                }
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                ) {
+                if (!isCompact || mobilePane == MobilePane.Library) {
                 MediaLibraryPanel(
                     state = state,
                     onImportClick = { mediaPickerLauncher.launch(arrayOf("video/*", "audio/*", "image/*")) },
@@ -441,11 +460,12 @@ fun EditProWorkspaceScreen(
                         dragAsset = null
                         if (dropped != null) dropAsset(dropped)
                     },
-                    modifier = Modifier.width(state.leftPanelWidthDp.dp)
+                    modifier = if (isCompact) Modifier.fillMaxSize() else Modifier.width(state.leftPanelWidthDp.dp)
                 )
+                }
 
-                // Left Vertical Splitter
-                Box(
+                // Left Vertical Splitter (tablet only - a phone has one pane, nothing to split)
+                if (!isCompact) Box(
                     modifier = Modifier
                         .width(5.dp)
                         .fillMaxHeight()
@@ -458,6 +478,7 @@ fun EditProWorkspaceScreen(
                         }
                 )
 
+                if (!isCompact || mobilePane == MobilePane.Preview) {
                 PreviewCenterPanel(
                     state = state,
                     onPlayPause = viewModel::togglePlayPause,
@@ -470,9 +491,10 @@ fun EditProWorkspaceScreen(
                     onGradeSplitChange = viewModel::setGradeSplitPercent,
                     modifier = Modifier.weight(1f)
                 )
+                }
 
                 // Right Vertical Splitter
-                Box(
+                if (!isCompact) Box(
                     modifier = Modifier
                         .width(5.dp)
                         .fillMaxHeight()
@@ -485,6 +507,7 @@ fun EditProWorkspaceScreen(
                         }
                 )
 
+                if (!isCompact || mobilePane == MobilePane.Inspector) {
                 InspectorPanel(
                     state = state,
                     onSelectTab = viewModel::setInspectorTab,
@@ -513,8 +536,10 @@ fun EditProWorkspaceScreen(
                     onFreezeFrame = viewModel::createFreezeFrameFromSelectedClip,
                     onRunHealthScan = viewModel::runProjectHealthScan,
                     onToggleSafeGuides = viewModel::toggleSafeGuides,
-                    modifier = Modifier.width(state.rightPanelWidthDp.dp)
+                    modifier = if (isCompact) Modifier.fillMaxSize() else Modifier.width(state.rightPanelWidthDp.dp)
                 )
+                }
+                }
             }
 
             // Horizontal Timeline Splitter
@@ -775,7 +800,8 @@ private fun TopHeaderBar(
     onOpenTools: () -> Unit,
     onSaveProject: () -> Unit,
     onOpenProject: () -> Unit,
-    onOpenExport: () -> Unit
+    onOpenExport: () -> Unit,
+    compact: Boolean = false
 ) {
     val palette = LocalEditProPalette.current
     Row(
@@ -786,9 +812,12 @@ private fun TopHeaderBar(
             .height(52.dp)
             .background(palette.panel.copy(alpha = 0.88f))
             .border(0.5.dp, palette.line)
-            .padding(horizontal = 14.dp)
+            // On a phone the header is wider than the screen, so it scrolls rather than clipping
+            // half the controls off the edge.
+            .then(if (compact) Modifier.horizontalScroll(rememberScrollState()) else Modifier)
+            .padding(horizontal = if (compact) 8.dp else 14.dp)
     ) {
-        AppWordmark(title = "Edit Pro")
+        if (!compact) AppWordmark(title = "Edit Pro")
 
         BasicTextField(
             value = state.projectName,
@@ -803,7 +832,7 @@ private fun TopHeaderBar(
             cursorBrush = SolidColor(palette.accent),
             modifier = Modifier
                 .onFocusChanged { onProjectNameFocusChange(it.isFocused) }
-                .width(170.dp)
+                .width(if (compact) 132.dp else 170.dp)
                 .clip(RoundedCornerShape(7.dp))
                 .background(palette.controlBg)
                 .padding(horizontal = 10.dp, vertical = 6.dp)
@@ -855,7 +884,7 @@ private fun TopHeaderBar(
             }
         }
 
-        Spacer(modifier = Modifier.weight(1f))
+        if (!compact) Spacer(modifier = Modifier.weight(1f))
 
         SmileIconButton(icon = SmileIconType.DEMO, accessibleLabel = "Demo Reel", onClick = onLoadDemoReel)
         SmileIconButton(icon = SmileIconType.NEW_PROJ, accessibleLabel = "New", onClick = onNewProject)
