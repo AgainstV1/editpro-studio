@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -39,6 +40,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.editpro.studio.viewmodel.AgentMessage
 import com.editpro.studio.viewmodel.EditorUiState
 
@@ -70,13 +72,19 @@ fun AgentChatDialog(
         if (scrollState.maxValue > 0) scrollState.animateScrollTo(scrollState.maxValue)
     }
 
-    Dialog(onDismissRequest = onDismiss) {
+    // decorFitsSystemWindows = false lets imePadding() actually see the keyboard inside this
+    // window; without it the dialog is drawn behind the keyboard and the key field disappears.
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(decorFitsSystemWindows = false)
+    ) {
         Column(
             verticalArrangement = Arrangement.spacedBy(10.dp),
             modifier = Modifier
                 .widthIn(max = 480.dp)
                 .fillMaxWidth()
-                .heightIn(max = 620.dp)
+                .imePadding()
+                .heightIn(max = 540.dp)
                 .clip(RoundedCornerShape(16.dp))
                 .background(palette.panel)
                 .border(0.5.dp, palette.line, RoundedCornerShape(16.dp))

@@ -1123,7 +1123,10 @@ fun EditingToolsDialog(
             }
             Text("Extra controls stay here so the main workspace stays clean.", color = palette.muted, fontSize = 12.sp)
 
-            InspectorActionButton("Preset packs · Import / Export (Ctrl+Alt+P)", isPrimary = true) {
+            InspectorActionButton("Editing assistant · AI edits with your own key", isPrimary = true) {
+                onDismiss(); onOpenAgentChat()
+            }
+            InspectorActionButton("Preset packs · Import / Export (Ctrl+Alt+P)") {
                 onDismiss(); onOpenPresets()
             }
             InspectorActionButton("Keyboard & mouse shortcuts") { onDismiss(); onOpenShortcuts() }
@@ -1133,9 +1136,6 @@ fun EditingToolsDialog(
                 if (state.scrubFollow) "Playhead follows cursor: On (Alt+F)"
                 else "Playhead follows cursor: Off (Alt+F)"
             ) { onToggleScrubFollow() }
-            InspectorActionButton("Editing assistant (bring your own key)") {
-                onDismiss(); onOpenAgentChat()
-            }
             InspectorActionButton(
                 if (state.mcpRunning) "Agent access (MCP): running" else "Agent access (MCP)"
             ) { onDismiss(); onOpenAgentAccess() }
