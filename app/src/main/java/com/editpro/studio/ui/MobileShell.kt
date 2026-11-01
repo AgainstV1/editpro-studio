@@ -16,9 +16,22 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+
+/**
+ * True when the window is phone-sized.
+ *
+ * Both axes are checked on purpose: a phone held sideways is wide but short, so judging on width
+ * alone would call it a tablet and leave every pane a sliver of vertical space.
+ */
+@Composable
+fun rememberIsCompact(): Boolean {
+    val configuration = LocalConfiguration.current
+    return configuration.screenWidthDp < 600 || configuration.screenHeightDp < 480
+}
 
 /** The three workspace panes. A tablet shows them together; a phone shows one at a time. */
 enum class MobilePane(val label: String) {

@@ -138,7 +138,7 @@ fun TimelinePanel(
     val palette = LocalEditProPalette.current
     val density = LocalDensity.current
     // On a phone the toolbar has more controls than fit, so it scrolls instead of clipping.
-    val compact = LocalConfiguration.current.screenWidthDp < 600
+    val compact = rememberIsCompact()
 
     Column(
         modifier = modifier

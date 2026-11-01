@@ -101,6 +101,7 @@ import com.editpro.studio.ui.AgentChatDialog
 import com.editpro.studio.ui.AlertSheetDialog
 import com.editpro.studio.ui.MobilePane
 import com.editpro.studio.ui.MobilePaneSwitcher
+import com.editpro.studio.ui.rememberIsCompact
 import com.editpro.studio.ui.ClipMenuSettingsDialog
 import com.editpro.studio.ui.ConfirmDialog
 import com.editpro.studio.ui.EditProStudioTheme
@@ -170,7 +171,7 @@ fun EditProWorkspaceScreen(
     var showAgentAccess by remember { mutableStateOf(false) }
 
     // Phone vs tablet. Drives the workspace (three panes or one) and the header (scrollable).
-    val isCompact = LocalConfiguration.current.screenWidthDp < 600
+    val isCompact = rememberIsCompact()
     var mobilePane by remember { mutableStateOf(MobilePane.Preview) }
 
     // Native Android Storage Access Framework Launchers

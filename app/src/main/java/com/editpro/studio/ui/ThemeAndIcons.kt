@@ -338,6 +338,8 @@ fun SmileIconButton(
     modifier: Modifier = Modifier
 ) {
     val palette = LocalEditProPalette.current
+    // A 30dp target is fine with a mouse and fiddly with a thumb, so phones get 44dp.
+    val touchMin = if (rememberIsCompact()) 44.dp else 30.dp
     val bgBrush = when {
         isPrimary -> Brush.verticalGradient(listOf(Color(0xFF2997FF), Color(0xFF0071E3)))
         isActive -> Brush.verticalGradient(listOf(Color(0xFF194F78), Color(0xFF123A5C)))
@@ -355,8 +357,8 @@ fun SmileIconButton(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center,
         modifier = modifier
-            .heightIn(min = 30.dp)
-            .widthIn(min = 32.dp)
+            .heightIn(min = touchMin)
+            .widthIn(min = if (rememberIsCompact()) 44.dp else 32.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(bgBrush)
             .border(
