@@ -158,6 +158,23 @@ fun TimelinePanel(
             SmileIconButton(icon = SmileIconType.UNDO, accessibleLabel = "Undo (Ctrl+Z)", enabled = state.canUndo, onClick = onUndo)
             SmileIconButton(icon = SmileIconType.REDO, accessibleLabel = "Redo (Ctrl+Shift+Z)", enabled = state.canRedo, onClick = onRedo)
 
+            // The playhead readout doubles as a scrub control - drag it sideways to seek.
+            DraggableTimecode(
+                seconds = state.playheadSec,
+                onDelta = { delta -> onSeek((state.playheadSec + delta).coerceAtLeast(0.0)) },
+                secondsPerDp = 0.05,
+                color = palette.text,
+                fontSize = 12.sp,
+                background = palette.controlBg
+            )
+            Text(
+                text = "/ ${formatTimecode(state.durationSec)}",
+                color = palette.muted,
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.padding(start = 4.dp)
+            )
+
             Spacer(modifier = Modifier.weight(1f))
 
             Slider(

@@ -204,15 +204,65 @@ fun InspectorPanel(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         SectionHeader("${clip.track.label} · CLIP")
-                        Text(
-                            text = formatTimecode(dur),
+                        // Drag to retime: left shortens the clip, right lengthens it.
+                        DraggableTimecode(
+                            seconds = dur,
+                            onDelta = { delta ->
+                                onUpdateClip { c ->
+                                    c.copy(trimOut = (c.trimOut + delta).coerceAtLeast(c.trimIn + 0.05))
+                                }
+                            },
+                            secondsPerDp = 0.02,
                             color = Color(0xFF6CB6FF),
                             fontSize = 10.sp,
-                            modifier = Modifier
-                                .background(Color(0x2E0A84FF), RoundedCornerShape(99.dp))
-                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                            background = Color(0x2E0A84FF)
                         )
                     }
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "START",
+                            color = palette.muted,
+                            fontSize = 9.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.width(46.dp)
+                        )
+                        DraggableTimecode(
+                            seconds = clip.startAt,
+                            onDelta = { delta ->
+                                onUpdateClip { c ->
+                                    c.copy(startAt = (c.startAt + delta).coerceAtLeast(0.0))
+                                }
+                            },
+                            secondsPerDp = 0.02,
+                            color = palette.text,
+                            fontSize = 11.sp,
+                            background = palette.controlBg
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            "END",
+                            color = palette.muted,
+                            fontSize = 9.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.width(30.dp)
+                        )
+                        DraggableTimecode(
+                            seconds = clip.startAt + dur,
+                            onDelta = { delta ->
+                                onUpdateClip { c ->
+                                    val end = c.startAt + TimelineEngine.clipDuration(c, state.assetsById)
+                                    val target = (end + delta).coerceAtLeast(c.startAt + 0.05)
+                                    c.copy(trimOut = (c.trimOut + (target - end)).coerceAtLeast(c.trimIn + 0.05))
+                                }
+                            },
+                            secondsPerDp = 0.02,
+                            color = palette.text,
+                            fontSize = 11.sp,
+                            background = palette.controlBg
+                        )
+                    }
+
                     OutlinedTextField(
                         value = clip.label,
                         onValueChange = { v -> onUpdateClip { it.copy(label = v) } },
