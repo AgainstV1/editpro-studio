@@ -3,7 +3,8 @@
 [![Android CI](https://github.com/AgainstV1/editpro-studio/actions/workflows/android-build.yml/badge.svg?branch=main)](https://github.com/AgainstV1/editpro-studio/actions/workflows/android-build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-informational.svg)](LICENSE)
 
-A multi-track video editor for Android tablets, written in Kotlin with Jetpack Compose. Everything
+A multi-track video editor for Android tablets and phones, written in Kotlin with Jetpack Compose.
+On a tablet the workspace is three panes side by side; on a phone they become tabs. Everything
 happens on the device: media is decoded, composited and encoded through Android's own
 `MediaCodec` / `MediaMuxer` pipeline — no web layer, no bundled FFmpeg, no third-party editing SDK.
 

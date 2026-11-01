@@ -2,6 +2,25 @@
 
 All notable changes to Edit Pro Studio (Android). Newest first.
 
+## 2.9.0 — unreleased
+
+### Added
+- **Phone support.** Below 600dp wide — or below 480dp tall, which catches a phone held sideways —
+  the three-pane workspace becomes one pane at a time with a Media / Preview / Inspector switcher.
+  The timeline stays visible underneath, because that is the surface you actually edit on.
+- Splitters are not drawn on a phone; with one pane there is nothing to split, and a draggable
+  5dp divider is just a place to mis-tap.
+
+### Changed
+- Icon buttons get a 44dp minimum touch target on phones, up from 30dp. Tablets keep the dense
+  look they had.
+- The header and timeline toolbar scroll horizontally on a phone instead of clipping controls off
+  the edge; the header also drops the wordmark and narrows the project name field.
+- Dialogs are capped at 86% of the window height as well as their own maximum, so they stay inside
+  a short landscape window.
+- One shared `rememberIsCompact()` replaces the per-file breakpoint checks, so the workspace,
+  header, timeline and buttons cannot disagree about what device they are on.
+
 ## 2.8.0 — unreleased
 
 ### Added
