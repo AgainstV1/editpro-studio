@@ -887,13 +887,13 @@ private fun TopHeaderBar(
 
         if (!compact) Spacer(modifier = Modifier.weight(1f))
 
-        SmileIconButton(icon = SmileIconType.DEMO, accessibleLabel = "Demo Reel", onClick = onLoadDemoReel)
-        SmileIconButton(icon = SmileIconType.NEW_PROJ, accessibleLabel = "New", onClick = onNewProject)
-        SmileIconButton(icon = SmileIconType.PRESETS, accessibleLabel = "Presets", onClick = onOpenPresets)
-        SmileIconButton(icon = SmileIconType.TOOLS, accessibleLabel = "Tools", onClick = onOpenTools)
-        SmileIconButton(icon = SmileIconType.SAVE_PROJ, accessibleLabel = "Save", onClick = onSaveProject)
-        SmileIconButton(icon = SmileIconType.OPEN_PROJ, accessibleLabel = "Open", onClick = onOpenProject)
-        SmileIconButton(icon = SmileIconType.EXPORT_VID, accessibleLabel = "Export", isPrimary = true, onClick = onOpenExport)
+        SmileIconButton(icon = SmileIconType.DEMO, accessibleLabel = "Demo Reel", label = "Demo", onClick = onLoadDemoReel)
+        SmileIconButton(icon = SmileIconType.NEW_PROJ, accessibleLabel = "New", label = "New", onClick = onNewProject)
+        SmileIconButton(icon = SmileIconType.PRESETS, accessibleLabel = "Presets", label = "Presets", onClick = onOpenPresets)
+        SmileIconButton(icon = SmileIconType.TOOLS, accessibleLabel = "Tools", label = "Tools", onClick = onOpenTools)
+        SmileIconButton(icon = SmileIconType.SAVE_PROJ, accessibleLabel = "Save", label = "Save", onClick = onSaveProject)
+        SmileIconButton(icon = SmileIconType.OPEN_PROJ, accessibleLabel = "Open", label = "Open", onClick = onOpenProject)
+        SmileIconButton(icon = SmileIconType.EXPORT_VID, accessibleLabel = "Export", label = "Export", isPrimary = true, onClick = onOpenExport)
     }
 }
 

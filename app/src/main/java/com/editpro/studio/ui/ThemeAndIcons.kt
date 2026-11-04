@@ -330,6 +330,8 @@ fun SmileIconButton(
     icon: SmileIconType,
     accessibleLabel: String,
     shortcutBadge: String? = null,
+    /** Short visible caption. Icon-only buttons are unidentifiable at a glance. */
+    label: String? = null,
     isPrimary: Boolean = false,
     isDanger: Boolean = false,
     isActive: Boolean = false,
@@ -371,6 +373,16 @@ fun SmileIconButton(
             .semantics { contentDescription = accessibleLabel }
     ) {
         SmileVectorIcon(type = icon, tint = contentColor)
+        if (!label.isNullOrBlank()) {
+            Spacer(modifier = Modifier.width(5.dp))
+            Text(
+                text = label,
+                color = contentColor,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1
+            )
+        }
         if (!shortcutBadge.isNullOrEmpty()) {
             Spacer(modifier = Modifier.width(4.dp))
             Text(
