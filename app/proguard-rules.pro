@@ -30,6 +30,7 @@
 
 # org.json — used by ProjectSerializer at runtime
 -dontwarn org.json.**
+-keep class org.json.** { *; }
 
 # MediaCodec / MediaMuxer pipelines are framework classes; nothing to keep.
 

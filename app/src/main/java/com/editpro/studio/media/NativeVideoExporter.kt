@@ -33,12 +33,30 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.lang.ref.SoftReference
 import java.nio.ByteBuffer
+import java.util.LinkedHashMap
 import kotlin.coroutines.coroutineContext
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
+
+/**
+ * Simple LRU cache with soft references to prevent OOM during long exports.
+ * Evicts least-recently-used entries when size exceeds [maxSize].
+ */
+class LruSoftCache<K, V>(private val maxSize: Int) {
+    private val map = object : LinkedHashMap<K, SoftReference<V>>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: Map.Entry<K, SoftReference<V>>): Boolean {
+            return size > maxSize
+        }
+    }
+
+    operator fun get(key: K): V? = map[key]?.get()
+    operator fun set(key: K, value: V) = map[key] = SoftReference(value)
+    fun clear() = map.clear()
+}
 
 data class ExportResult(
     val success: Boolean,
@@ -102,16 +120,17 @@ object NativeVideoExporter {
         onProgress(2, "Initializing Android Hardware H.264 encoder (${width}×${height} @ ${fps}fps)…")
 
         // Preload image bitmaps and open MediaMetadataRetrievers for video clips
-        val bitmapCache = mutableMapOf<String, Bitmap>()
-        val videoRetrievers = mutableMapOf<String, MediaMetadataRetriever>()
+        // Use LRU cache with soft references to prevent OOM on large projects
+        val bitmapCache = LruSoftCache<String, Bitmap>(maxSize = 50)
+        val videoRetrievers = LruSoftCache<String, MediaMetadataRetriever>(maxSize = 20)
 
         try {
             for (rc in visibleVisuals) {
                 val asset = assetsById[rc.clip.assetId] ?: continue
                 val path = asset.localPath ?: continue
-                if (asset.kind == AssetKind.IMAGE && !bitmapCache.containsKey(asset.id)) {
+                if (asset.kind == AssetKind.IMAGE && bitmapCache[asset.id] == null) {
                     BitmapFactory.decodeFile(path)?.let { bitmapCache[asset.id] = it }
-                } else if (asset.kind == AssetKind.VIDEO && !videoRetrievers.containsKey(asset.id)) {
+                } else if (asset.kind == AssetKind.VIDEO && videoRetrievers[asset.id] == null) {
                     val ret = MediaMetadataRetriever()
                     try {
                         ret.setDataSource(path)
@@ -276,8 +295,8 @@ object NativeVideoExporter {
                 message = "Export failed: ${e.message ?: e.javaClass.simpleName}"
             )
         } finally {
-            bitmapCache.values.forEach { it.recycle() }
-            videoRetrievers.values.forEach { try { it.release() } catch (_: Exception) {} }
+            bitmapCache.clear()
+            videoRetrievers.clear()
         }
     }
 

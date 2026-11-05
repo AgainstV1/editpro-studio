@@ -1,5 +1,7 @@
 package com.editpro.studio.mcp
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -243,7 +245,7 @@ class McpServer(
                 "tools/call" -> {
                     val name = params.optString("name", "")
                     val args = params.optJSONObject("arguments") ?: JSONObject()
-                    ok(id, tools.call(name, args))
+                    ok(id, runBlocking { tools.call(name, args) })
                 }
                 "resources/list" -> ok(id, JSONObject().put("resources", JSONArray()))
                 "prompts/list" -> ok(id, JSONObject().put("prompts", JSONArray()))

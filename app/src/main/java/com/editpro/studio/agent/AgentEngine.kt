@@ -84,10 +84,9 @@ class AgentEngine(private val tools: McpTools) {
 
             reply.toolCalls.forEach { call ->
                 onEvent(Event.ToolStarted(call.name))
-                val result = runCatching {
+                val payload = try {
                     tools.execute(call.name, parseArguments(call.arguments))
-                }
-                val payload = result.getOrElse { error ->
+                } catch (error: Exception) {
                     JSONObject().put("error", error.message ?: error.javaClass.simpleName).toString()
                 }
                 onEvent(Event.ToolFinished(call.name, summarise(payload)))

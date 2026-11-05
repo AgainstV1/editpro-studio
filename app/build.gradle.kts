@@ -2,6 +2,8 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.serialization")
+    id("io.gitlab.arturbosch.detekt")
+    id("org.jlleitschuh.gradle.ktlint")
 }
 
 android {
@@ -114,4 +116,28 @@ dependencies {
     // tests fail without a genuine implementation here.
     testImplementation("org.json:json:20240303")
     debugImplementation("androidx.compose.ui:ui-tooling")
+}
+
+// Detekt configuration
+detekt {
+    config = files("$projectDir/../detekt.yml")
+    buildUponDefaultConfig = true
+    parallel = true
+}
+
+// Ktlint configuration
+ktlint {
+    version = "1.2.1"
+    android = true
+    outputToConsole = true
+    reporters {
+        reporter("plain")
+        reporter("checkstyle", output = file("$buildDir/reports/ktlint/ktlint-checkstyle.xml"))
+    }
+}
+
+tasks.withType<org.jlleitschuh.gradle.ktlint.KtlintTask> {
+    reports {
+        html.enabled = false
+    }
 }
