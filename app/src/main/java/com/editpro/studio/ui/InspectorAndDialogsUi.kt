@@ -31,8 +31,35 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isAltPressed
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isMetaPressed
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.nativeKeyCode
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.TextStyle
+import com.editpro.studio.media.TitleRenderer
+import com.editpro.studio.model.EditorShortcut
+import com.editpro.studio.model.KeyframeOps
+import com.editpro.studio.model.MgTemplate
+import com.editpro.studio.model.MotionGraphics
+import com.editpro.studio.model.ShortcutBindings
+import com.editpro.studio.model.ShortcutChords
+import kotlin.math.abs
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -103,12 +130,24 @@ fun InspectorPanel(
     onFreezeFrame: () -> Unit,
     onRunHealthScan: () -> Unit,
     onToggleSafeGuides: () -> Unit,
+    onSeek: (Double) -> Unit = {},
+    onSetKeyframeEasing: (Int, String) -> Unit = { _, _ -> },
+    onJumpKeyframe: (Int) -> Unit = {},
+    onRemoveKeyframeAtPlayhead: () -> Unit = {},
+    onToggleKeyframeLane: () -> Unit = {},
+    onOpenGraphics: () -> Unit = {},
+    /** Collapses the panel to a rail; null where there is no rail (a phone shows one pane). */
+    onCollapse: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val palette = LocalEditProPalette.current
-    val clip = state.selectedClip
+    // Once a clip is animated the sliders show the values under the playhead (what is on
+    // screen), and changing one keys it there.
+    val clip = state.inspectedClip
     val scroll = rememberScrollState()
 
+    // Every slider in the panel takes one undo snapshot when a drag on it begins.
+    CompositionLocalProvider(LocalEditStart provides onSnapHistory) {
     Column(
         modifier = modifier
             .fillMaxHeight()
@@ -118,19 +157,25 @@ fun InspectorPanel(
         // Panel Header
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
         ) {
+            if (onCollapse != null) {
+                PanelToggleButton(glyph = "›", description = "Hide inspector", onClick = onCollapse)
+            }
             Text(
-                text = "INSPECTOR",
+                text = if (state.selectionIds.size > 1) "INSPECTOR · ${state.selectionIds.size} CLIPS" else "INSPECTOR",
                 color = palette.muted,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.SemiBold,
-                letterSpacing = 0.7.sp
+                letterSpacing = 0.7.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
             )
             SmileIconButton(
                 icon = SmileIconType.RESET,
-                accessibleLabel = "Reset",
+                accessibleLabel = "Reset effects and transform",
                 onClick = onResetClip
             )
         }
@@ -145,6 +190,8 @@ fun InspectorPanel(
                     color = palette.muted,
                     fontSize = 12.sp
                 )
+                SectionHeader("ADD TO THE TIMELINE")
+                InspectorActionButton("＋ Motion graphic…", onClick = onOpenGraphics)
                 SectionHeader("PROJECT TOOLS")
                 InspectorActionButton("Run project health scan", onClick = onRunHealthScan)
                 InspectorActionButton("Toggle safe-area guides", onClick = onToggleSafeGuides)
@@ -156,6 +203,24 @@ fun InspectorPanel(
                 )
             }
             return@Column
+        }
+
+        if (state.selectionIds.size > 1) {
+            Text(
+                "Several clips are selected. The controls below edit the highlighted one; move, delete, " +
+                    "copy and the clip menu act on all of them.",
+                color = palette.muted,
+                fontSize = 10.5.sp,
+                modifier = Modifier.padding(bottom = 6.dp)
+            )
+        }
+        if (clip.keyframes.isNotEmpty()) {
+            Text(
+                "◆ Animated: values are shown at the playhead, and changing one sets a keyframe there.",
+                color = Color(0xFFFFD60A),
+                fontSize = 10.5.sp,
+                modifier = Modifier.padding(bottom = 6.dp)
+            )
         }
 
         // 5-Tab Sticky Inspector Bar (Clip, Layout, Motion, Effects, Audio)
@@ -207,6 +272,7 @@ fun InspectorPanel(
                         // Drag to retime: left shortens the clip, right lengthens it.
                         DraggableTimecode(
                             seconds = dur,
+                            onDragStart = onSnapHistory,
                             onDelta = { delta ->
                                 onUpdateClip { c ->
                                     c.copy(trimOut = (c.trimOut + delta).coerceAtLeast(c.trimIn + 0.05))
@@ -229,6 +295,7 @@ fun InspectorPanel(
                         )
                         DraggableTimecode(
                             seconds = clip.startAt,
+                            onDragStart = onSnapHistory,
                             onDelta = { delta ->
                                 onUpdateClip { c ->
                                     c.copy(startAt = (c.startAt + delta).coerceAtLeast(0.0))
@@ -249,6 +316,7 @@ fun InspectorPanel(
                         )
                         DraggableTimecode(
                             seconds = clip.startAt + dur,
+                            onDragStart = onSnapHistory,
                             onDelta = { delta ->
                                 onUpdateClip { c ->
                                     val end = c.startAt + TimelineEngine.clipDuration(c, state.assetsById)
@@ -268,40 +336,10 @@ fun InspectorPanel(
                         onValueChange = { v -> onUpdateClip { it.copy(label = v) } },
                         label = { Text("Clip name") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) onSnapHistory() }
                     )
-                    if (clip.track == TimelineTrack.TEXT) {
-                        OutlinedTextField(
-                            value = clip.text,
-                            onValueChange = { v -> onUpdateClip { it.copy(text = v) } },
-                            label = { Text("Title / Subtitle Text") },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        InspectorSlider(
-                            label = "Font Size",
-                            valueText = "${clip.fontSize}px",
-                            value = clip.fontSize.toFloat(),
-                            range = 12f..140f,
-                            onValueChange = { v -> onUpdateClip { it.copy(fontSize = v.roundToInt()) } }
-                        )
-                        InspectorSlider(
-                            label = "Outline Width",
-                            valueText = "${clip.strokeWidth.roundToInt()}px",
-                            value = clip.strokeWidth,
-                            range = 0f..8f,
-                            onValueChange = { v -> onUpdateClip { it.copy(strokeWidth = v) } }
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            listOf("top" to "Top", "center" to "Center", "bottom" to "Bottom").forEach { (pos, lbl) ->
-                                InspectorActionButton(
-                                    text = lbl,
-                                    isPrimary = clip.verticalPosition == pos,
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    onUpdateClip { it.copy(verticalPosition = pos) }
-                                }
-                            }
-                        }
+                    if (clip.track.isTitle) {
+                        TitleAndGraphicFields(clip = clip, onUpdateClip = onUpdateClip, onSnapHistory = onSnapHistory)
                     }
 
                     InspectorSlider(
@@ -434,21 +472,21 @@ fun InspectorPanel(
                         }
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        InspectorActionButton("◆ Add keyframe", isPrimary = true, modifier = Modifier.weight(1f), onClick = onAddKeyframe)
-                        InspectorActionButton("Clear all", modifier = Modifier.weight(1f), onClick = onClearKeyframes)
-                    }
-                    clip.keyframes.forEachIndexed { idx, kf ->
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
-                        ) {
-                            Text("◆ ${formatTimecode(kf.time)}", color = Color(0xFFFFD60A), fontSize = 11.sp)
-                            Text("${kf.scale.roundToInt()}% · x${kf.x.roundToInt()} y${kf.y.roundToInt()}", color = palette.muted, fontSize = 10.sp)
-                            Text("×", color = palette.red, modifier = Modifier.clickable { onRemoveKeyframe(idx) }.padding(4.dp))
-                        }
-                    }
+                    KeyframeEditor(
+                        clip = clip,
+                        clipStart = state.resolvedClips.find { it.clip.id == clip.id }?.start ?: clip.startAt,
+                        playheadSec = state.playheadSec,
+                        laneShown = state.showKeyframeLane,
+                        bindings = state.bindings,
+                        onAddKeyframe = onAddKeyframe,
+                        onRemoveKeyframe = onRemoveKeyframe,
+                        onRemoveAtPlayhead = onRemoveKeyframeAtPlayhead,
+                        onClearKeyframes = onClearKeyframes,
+                        onSetEasing = onSetKeyframeEasing,
+                        onJump = onJumpKeyframe,
+                        onSeek = onSeek,
+                        onToggleLane = onToggleKeyframeLane
+                    )
                 }
 
                 InspectorTab.FX -> {
@@ -596,6 +634,7 @@ fun InspectorPanel(
                 }
             }
         }
+    }
     }
 }
 
@@ -867,6 +906,12 @@ fun SectionHeader(title: String) {
     )
 }
 
+/**
+ * Called once when a slider drag begins. The inspector provides "take an undo snapshot" here, so
+ * a whole drag is one undo step instead of none at all.
+ */
+val LocalEditStart = staticCompositionLocalOf<() -> Unit> { {} }
+
 @Composable
 fun InspectorSlider(
     label: String,
@@ -876,6 +921,8 @@ fun InspectorSlider(
     onValueChange: (Float) -> Unit
 ) {
     val palette = LocalEditProPalette.current
+    val onEditStart = LocalEditStart.current
+    var dragging by remember { mutableStateOf(false) }
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -886,7 +933,14 @@ fun InspectorSlider(
         }
         Slider(
             value = value.coerceIn(range.start, range.endInclusive),
-            onValueChange = onValueChange,
+            onValueChange = { v ->
+                if (!dragging) {
+                    dragging = true
+                    onEditStart()
+                }
+                onValueChange(v)
+            },
+            onValueChangeFinished = { dragging = false },
             valueRange = range,
             colors = SliderDefaults.colors(
                 thumbColor = Color.White,
@@ -895,6 +949,262 @@ fun InspectorSlider(
             ),
             modifier = Modifier.height(24.dp)
         )
+    }
+}
+
+private val SWATCHES = listOf(
+    "#ffffff", "#000000", "#ffd60a", "#ff9f0a", "#ff3b30", "#ff375f", "#bf5af2", "#0a84ff", "#64d2ff", "#30d158"
+)
+
+/** A row of colour swatches plus a hex field, for text and accent colours. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun ColorSwatchRow(label: String, value: String, onPick: (String) -> Unit) {
+    val palette = LocalEditProPalette.current
+    var hex by remember(value) { mutableStateOf(value) }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.fillMaxWidth()) {
+        Text(text = label, color = palette.text, fontSize = 11.5.sp)
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            SWATCHES.forEach { swatch ->
+                val selected = swatch.equals(value, ignoreCase = true)
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(CircleShape)
+                        .background(parseHexColor(swatch))
+                        .border(
+                            width = if (selected) 2.dp else 0.5.dp,
+                            color = if (selected) palette.accent else palette.line,
+                            shape = CircleShape
+                        )
+                        .clickable(role = Role.Button) { onPick(swatch) }
+                )
+            }
+            BasicTextField(
+                value = hex,
+                onValueChange = { typed ->
+                    hex = typed.take(7)
+                    if (Regex("#[0-9a-fA-F]{6}").matches(hex)) onPick(hex.lowercase())
+                },
+                singleLine = true,
+                textStyle = TextStyle(color = palette.text, fontSize = 11.sp, fontFamily = FontFamily.Monospace),
+                cursorBrush = SolidColor(palette.accent),
+                modifier = Modifier
+                    .width(74.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(palette.controlBg)
+                    .padding(horizontal = 7.dp, vertical = 5.dp)
+            )
+        }
+    }
+}
+
+/** Text, colours, position and — for motion graphics — the template's own settings. */
+@Composable
+private fun TitleAndGraphicFields(
+    clip: TimelineClip,
+    onUpdateClip: ((TimelineClip) -> TimelineClip) -> Unit,
+    onSnapHistory: () -> Unit
+) {
+    val palette = LocalEditProPalette.current
+    val template: MgTemplate? = if (clip.isGraphic) MotionGraphics.find(clip.graphic) else null
+    val isShape = clip.graphic.startsWith("shape_")
+    if (clip.isGraphic) {
+        SectionHeader("MOTION GRAPHIC · ${(template?.title ?: clip.graphic).uppercase()}")
+        template?.description?.let { Text(it, color = palette.muted, fontSize = 11.sp) }
+    }
+    if (!isShape) {
+        OutlinedTextField(
+            value = clip.text,
+            onValueChange = { v -> onUpdateClip { it.copy(text = v) } },
+            label = { Text(if (clip.isGraphic) "Text" else "Title / Subtitle Text") },
+            modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) onSnapHistory() }
+        )
+        template?.textHint?.takeIf { it.isNotEmpty() }?.let { Text(it, color = palette.muted, fontSize = 10.5.sp) }
+        InspectorSlider(
+            label = "Font Size",
+            valueText = "${clip.fontSize}px",
+            value = clip.fontSize.toFloat(),
+            range = 12f..200f,
+            onValueChange = { v -> onUpdateClip { it.copy(fontSize = v.roundToInt()) } }
+        )
+        ColorSwatchRow("Text colour", clip.textColor) { picked ->
+            onSnapHistory()
+            onUpdateClip { it.copy(textColor = picked) }
+        }
+    }
+    if (clip.isGraphic) {
+        ColorSwatchRow(if (isShape) "Colour" else "Accent colour", clip.accentColor) { picked ->
+            onSnapHistory()
+            onUpdateClip { it.copy(accentColor = picked) }
+        }
+    }
+    if (!clip.isGraphic || isShape) {
+        InspectorSlider(
+            label = if (isShape) "Outline only (0 = filled)" else "Outline Width",
+            valueText = "${clip.strokeWidth.roundToInt()}px",
+            value = clip.strokeWidth,
+            range = 0f..8f,
+            onValueChange = { v -> onUpdateClip { it.copy(strokeWidth = v) } }
+        )
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        listOf("top" to "Top", "center" to "Middle", "bottom" to "Bottom").forEach { (pos, lbl) ->
+            InspectorActionButton(
+                text = lbl,
+                isPrimary = clip.verticalPosition == pos,
+                modifier = Modifier.weight(1f)
+            ) {
+                onSnapHistory()
+                onUpdateClip { it.copy(verticalPosition = pos) }
+            }
+        }
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        listOf("left" to "Left", "center" to "Centre", "right" to "Right").forEach { (align, lbl) ->
+            InspectorActionButton(
+                text = lbl,
+                isPrimary = clip.textAlign == align,
+                modifier = Modifier.weight(1f)
+            ) {
+                onSnapHistory()
+                onUpdateClip { it.copy(textAlign = align) }
+            }
+        }
+    }
+    if (clip.isGraphic) {
+        InspectorSlider(
+            label = "Intro / outro length",
+            valueText = "${"%.2f".format(clip.transitionDuration)}s",
+            value = clip.transitionDuration.toFloat(),
+            range = 0f..2f,
+            onValueChange = { v -> onUpdateClip { it.copy(transitionDuration = v.toDouble()) } }
+        )
+        if (template?.usesBox == true) {
+            InspectorSlider(
+                label = "Width",
+                valueText = "${"%.1f".format(clip.boxW)}%",
+                value = clip.boxW.toFloat(),
+                range = 0.2f..100f,
+                onValueChange = { v -> onUpdateClip { it.copy(boxW = v.toDouble()) } }
+            )
+            InspectorSlider(
+                label = "Height",
+                valueText = "${"%.1f".format(clip.boxH)}%",
+                value = clip.boxH.toFloat(),
+                range = 0.2f..100f,
+                onValueChange = { v -> onUpdateClip { it.copy(boxH = v.toDouble()) } }
+            )
+        }
+        Text(
+            "Move, scale, rotate and fade it in the Layout tab; it can be keyframed like any clip.",
+            color = palette.muted,
+            fontSize = 10.5.sp
+        )
+    }
+}
+
+/**
+ * The keyframe list for the selected clip: add or update at the playhead, step between
+ * keyframes, pick how each one eases into the next, and jump to any of them with a tap.
+ */
+@Composable
+private fun KeyframeEditor(
+    clip: TimelineClip,
+    clipStart: Double,
+    playheadSec: Double,
+    laneShown: Boolean,
+    bindings: ShortcutBindings,
+    onAddKeyframe: () -> Unit,
+    onRemoveKeyframe: (Int) -> Unit,
+    onRemoveAtPlayhead: () -> Unit,
+    onClearKeyframes: () -> Unit,
+    onSetEasing: (Int, String) -> Unit,
+    onJump: (Int) -> Unit,
+    onSeek: (Double) -> Unit,
+    onToggleLane: () -> Unit
+) {
+    val palette = LocalEditProPalette.current
+    val keys = clip.keyframes.sortedBy { it.time }
+    val localT = playheadSec - clipStart
+    val atPlayhead = KeyframeOps.indexAt(clip, localT)
+
+    SectionHeader("KEYFRAMES · ${keys.size}")
+    Text(
+        "Put the playhead where a change should happen, then set Scale, Position, Rotation or Opacity " +
+            "in the Layout tab. With at least one keyframe on the clip, the change is keyed automatically.",
+        color = palette.muted,
+        fontSize = 10.5.sp
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        InspectorActionButton("◀", modifier = Modifier.width(44.dp)) { onJump(-1) }
+        InspectorActionButton(
+            text = (if (atPlayhead >= 0) "◆ Update keyframe" else "◆ Add keyframe") +
+                (bindings.hint(EditorShortcut.ADD_KEYFRAME)?.let { "  ·  $it" } ?: ""),
+            isPrimary = true,
+            modifier = Modifier.weight(1f),
+            onClick = onAddKeyframe
+        )
+        InspectorActionButton("▶", modifier = Modifier.width(44.dp)) { onJump(1) }
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        InspectorActionButton("Delete here", modifier = Modifier.weight(1f), onClick = onRemoveAtPlayhead)
+        InspectorActionButton("Clear all", modifier = Modifier.weight(1f), onClick = onClearKeyframes)
+    }
+    InspectorActionButton(
+        text = if (laneShown) "Keyframe lane in timeline: On" else "Keyframe lane in timeline: Off",
+        onClick = onToggleLane
+    )
+    keys.forEachIndexed { idx, kf ->
+        val here = idx == atPlayhead
+        val easingLabel = KeyframeOps.EASINGS.firstOrNull { it.first == kf.easing }?.second ?: "Clip curve"
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(7.dp))
+                .background(if (here) Color(0x33FFD60A) else palette.controlBg)
+                .clickable(role = Role.Button) { onSeek(clipStart + kf.time) }
+                .padding(horizontal = 8.dp, vertical = 5.dp)
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("◆ ${formatTimecode(kf.time)}", color = Color(0xFFFFD60A), fontSize = 11.sp)
+                Text(
+                    "${kf.scale.roundToInt()}% · x${kf.x.roundToInt()} y${kf.y.roundToInt()} · " +
+                        "${kf.rotation.roundToInt()}° · ${kf.opacity.roundToInt()}% opacity",
+                    color = palette.muted,
+                    fontSize = 9.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            // Tap to step through the easing choices for the move that starts at this keyframe.
+            Text(
+                text = easingLabel,
+                color = palette.text,
+                fontSize = 10.sp,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(99.dp))
+                    .background(palette.panel2)
+                    .border(0.5.dp, palette.line, RoundedCornerShape(99.dp))
+                    .clickable(role = Role.Button) {
+                        val order = KeyframeOps.EASINGS.map { it.first }
+                        val next = order[(order.indexOf(kf.easing).coerceAtLeast(0) + 1) % order.size]
+                        onSetEasing(idx, next)
+                    }
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            )
+            Text(
+                "×",
+                color = palette.red,
+                fontSize = 14.sp,
+                modifier = Modifier.clickable(role = Role.Button) { onRemoveKeyframe(idx) }.padding(6.dp)
+            )
+        }
     }
 }
 
@@ -1116,53 +1426,66 @@ fun ExportVideoDialog(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
+/**
+ * Everything that does not earn a permanent button. Each row runs through the same action the
+ * keyboard uses and shows the key currently bound to it, so the panel doubles as a reminder of
+ * the shortcuts.
+ */
 @Composable
 fun EditingToolsDialog(
     state: EditorUiState,
     onDismiss: () -> Unit,
-    onOpenPresets: () -> Unit,
-    onSetRangeIn: () -> Unit,
-    onSetRangeOut: () -> Unit,
-    onAddMarker: () -> Unit,
+    onRun: (EditorShortcut) -> Unit,
     onOpenSolidModal: () -> Unit,
     onImportSrtClick: () -> Unit,
-    onDuplicate: () -> Unit,
-    onRippleDelete: () -> Unit,
     onMoveToPlayhead: () -> Unit,
-    onNudgeBack: () -> Unit,
-    onNudgeForward: () -> Unit,
-    onPrevMarker: () -> Unit,
-    onNextMarker: () -> Unit,
     onToggleSafeGuides: () -> Unit,
     onToggleChecker: () -> Unit,
     onHealthScan: () -> Unit,
-    onSelectNext: () -> Unit,
-    onSelectPrev: () -> Unit,
     onClearTimeline: () -> Unit,
-    onToggleSnap: () -> Unit,
+    onClearMarkers: () -> Unit,
+    onCollapseEmptyTracks: () -> Unit,
+    onSelectUnusedMedia: () -> Unit,
     onToggleAutoFit: () -> Unit,
     onToggleCompact: () -> Unit,
-    onOpenShortcuts: () -> Unit,
-    onToggleFullscreen: () -> Unit,
     onOpenClipMenu: () -> Unit,
-    onToggleScrubFollow: () -> Unit,
-    onOpenAgentAccess: () -> Unit,
-    onOpenAgentChat: () -> Unit
+    onOpenAgentAccess: () -> Unit
 ) {
     val palette = LocalEditProPalette.current
+
+    fun withKey(text: String, action: EditorShortcut): String =
+        state.bindings.hint(action)?.let { "$text  ·  $it" } ?: text
+
     Dialog(onDismissRequest = onDismiss) {
         Column(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(max = minOf(560.dp, rememberDialogMaxHeight()))
+                .heightIn(max = minOf(600.dp, rememberDialogMaxHeight()))
                 .clip(RoundedCornerShape(16.dp))
                 .background(palette.panel)
                 .border(0.5.dp, palette.line, RoundedCornerShape(16.dp))
                 .padding(16.dp)
                 .verticalScroll(rememberScrollState())
         ) {
+            // A row that closes the panel and runs an action.
+            @Composable
+            fun Tool(text: String, action: EditorShortcut, primary: Boolean = false) {
+                InspectorActionButton(withKey(text, action), isPrimary = primary) {
+                    onDismiss()
+                    onRun(action)
+                }
+            }
+
+            // A row for a setting, which stays open so several can be flipped in one visit.
+            @Composable
+            fun Setting(text: String, on: Boolean, action: EditorShortcut? = null, onToggle: (() -> Unit)? = null) {
+                val label = "$text: ${if (on) "On" else "Off"}"
+                InspectorActionButton(if (action != null) withKey(label, action) else label) {
+                    if (action != null) onRun(action) else onToggle?.invoke()
+                }
+            }
+
             Row(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
@@ -1173,48 +1496,86 @@ fun EditingToolsDialog(
             }
             Text("Extra controls stay here so the main workspace stays clean.", color = palette.muted, fontSize = 12.sp)
 
-            InspectorActionButton("Editing assistant · AI edits with your own key", isPrimary = true) {
-                onDismiss(); onOpenAgentChat()
-            }
-            InspectorActionButton("Preset packs · Import / Export (Ctrl+Alt+P)") {
-                onDismiss(); onOpenPresets()
-            }
-            InspectorActionButton("Keyboard & mouse shortcuts") { onDismiss(); onOpenShortcuts() }
-            InspectorActionButton("Toggle full screen") { onDismiss(); onToggleFullscreen() }
+            Tool("Editing assistant · AI edits with your own key", EditorShortcut.ASSISTANT, primary = true)
+            Tool("Keyboard shortcuts · view and change", EditorShortcut.SHORTCUTS)
             InspectorActionButton("Customise clip menu") { onDismiss(); onOpenClipMenu() }
-            InspectorActionButton(
-                if (state.scrubFollow) "Playhead follows cursor: On (Alt+F)"
-                else "Playhead follows cursor: Off (Alt+F)"
-            ) { onToggleScrubFollow() }
             InspectorActionButton(
                 if (state.mcpRunning) "Agent access (MCP): running" else "Agent access (MCP)"
             ) { onDismiss(); onOpenAgentAccess() }
-            InspectorActionButton("＋ Add solid colour clip") { onDismiss(); onOpenSolidModal() }
-            InspectorActionButton("Import subtitles (SRT)") { onDismiss(); onImportSrtClick() }
-            InspectorActionButton("Add marker at playhead") { onDismiss(); onAddMarker() }
-            InspectorActionButton("Set export In point here") { onDismiss(); onSetRangeIn() }
-            InspectorActionButton("Set export Out point here") { onDismiss(); onSetRangeOut() }
-            InspectorActionButton("Duplicate selected clip") { onDismiss(); onDuplicate() }
-            InspectorActionButton("Ripple delete") { onDismiss(); onRippleDelete() }
-            InspectorActionButton("Move clip to playhead") { onDismiss(); onMoveToPlayhead() }
+
+            SectionHeader("ADD")
+            Tool("Motion graphic", EditorShortcut.ADD_GRAPHIC)
+            Tool("Text clip", EditorShortcut.ADD_TEXT)
+            InspectorActionButton("Solid colour clip") { onDismiss(); onOpenSolidModal() }
+            InspectorActionButton("Subtitles from an SRT file") { onDismiss(); onImportSrtClick() }
+            Tool("Import media", EditorShortcut.IMPORT_MEDIA)
+
+            SectionHeader("EDIT AT THE PLAYHEAD")
+            Tool("Split every track", EditorShortcut.SPLIT_ALL)
+            Tool("Trim start to playhead", EditorShortcut.TRIM_START)
+            Tool("Trim end to playhead", EditorShortcut.TRIM_END)
+            Tool("Ripple trim start", EditorShortcut.RIPPLE_TRIM_START)
+            Tool("Ripple trim end", EditorShortcut.RIPPLE_TRIM_END)
+            InspectorActionButton("Move selection to playhead") { onDismiss(); onMoveToPlayhead() }
+
+            SectionHeader("SELECTION")
+            Tool("Copy", EditorShortcut.COPY)
+            Tool("Cut", EditorShortcut.CUT)
+            Tool("Paste at playhead", EditorShortcut.PASTE)
+            Tool("Duplicate", EditorShortcut.DUPLICATE)
+            Tool("Ripple delete", EditorShortcut.RIPPLE_DELETE)
+            Tool("Detach audio from video", EditorShortcut.DETACH_AUDIO)
+            Tool("Close gaps", EditorShortcut.CLOSE_GAPS)
+            Tool("Select all clips", EditorShortcut.SELECT_ALL)
+            Tool("Select everything after the playhead", EditorShortcut.SELECT_FORWARD)
+            Tool("Deselect", EditorShortcut.DESELECT)
+            Setting("Multi-select (tap adds to selection)", state.selectionMode, EditorShortcut.SELECTION_MODE)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                InspectorActionButton("Nudge −0.5s", modifier = Modifier.weight(1f)) { onNudgeBack() }
-                InspectorActionButton("Nudge +0.5s", modifier = Modifier.weight(1f)) { onNudgeForward() }
+                InspectorActionButton("Nudge −1 frame", modifier = Modifier.weight(1f)) { onRun(EditorShortcut.NUDGE_LEFT) }
+                InspectorActionButton("Nudge +1 frame", modifier = Modifier.weight(1f)) { onRun(EditorShortcut.NUDGE_RIGHT) }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                InspectorActionButton("Prev marker", modifier = Modifier.weight(1f)) { onPrevMarker() }
-                InspectorActionButton("Next marker", modifier = Modifier.weight(1f)) { onNextMarker() }
+                InspectorActionButton("Select prev clip", modifier = Modifier.weight(1f)) { onRun(EditorShortcut.SELECT_PREV) }
+                InspectorActionButton("Select next clip", modifier = Modifier.weight(1f)) { onRun(EditorShortcut.SELECT_NEXT) }
             }
+
+            SectionHeader("MARKERS & EXPORT RANGE")
+            Tool("Add marker at playhead", EditorShortcut.ADD_MARKER)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                InspectorActionButton("Select prev clip", modifier = Modifier.weight(1f)) { onSelectPrev() }
-                InspectorActionButton("Select next clip", modifier = Modifier.weight(1f)) { onSelectNext() }
+                InspectorActionButton("Prev marker", modifier = Modifier.weight(1f)) { onRun(EditorShortcut.PREV_MARKER) }
+                InspectorActionButton("Next marker", modifier = Modifier.weight(1f)) { onRun(EditorShortcut.NEXT_MARKER) }
             }
-            InspectorActionButton("🧲 Magnetic snapping: ${if (state.magneticSnap) "On" else "Off"}", onClick = onToggleSnap)
-            InspectorActionButton("⤢ Auto Fit timeline: ${if (state.timelineAutoFit) "On" else "Off"}", onClick = onToggleAutoFit)
-            InspectorActionButton("▤ Compact timeline: ${if (state.timelineCompact) "On" else "Off"}", onClick = onToggleCompact)
-            InspectorActionButton("Toggle safe-area guides", onClick = onToggleSafeGuides)
-            InspectorActionButton("Toggle checkerboard preview", onClick = onToggleChecker)
+            Tool("Set export In point here", EditorShortcut.MARK_IN)
+            Tool("Set export Out point here", EditorShortcut.MARK_OUT)
+            Tool("Clear export range", EditorShortcut.CLEAR_RANGE)
+            InspectorActionButton("Delete all markers") { onDismiss(); onClearMarkers() }
+
+            SectionHeader("PANELS & VIEW")
+            Setting("Media library", !state.libraryCollapsed, EditorShortcut.TOGGLE_LIBRARY)
+            Setting("Inspector", !state.inspectorCollapsed, EditorShortcut.TOGGLE_INSPECTOR)
+            Setting("Timeline", !state.timelineCollapsed, EditorShortcut.TOGGLE_TIMELINE)
+            Setting("Maximised preview", state.previewMaximized, EditorShortcut.MAXIMIZE_PREVIEW)
+            Tool("Full screen", EditorShortcut.FULLSCREEN)
+            Setting("Keyframe lane", state.showKeyframeLane, EditorShortcut.KEYFRAME_LANE)
+            Tool("Collapse / expand all tracks", EditorShortcut.COLLAPSE_TRACKS)
+            InspectorActionButton("Collapse empty tracks") { onCollapseEmptyTracks() }
+            Setting("Magnetic snapping", state.magneticSnap, EditorShortcut.TOGGLE_SNAP)
+            Setting("Fit timeline to window", state.timelineAutoFit, onToggle = onToggleAutoFit)
+            Setting("Compact timeline rows", state.timelineCompact, onToggle = onToggleCompact)
+            Setting("Follow playhead", state.timelineFollowPlayhead, EditorShortcut.TOGGLE_FOLLOW)
+            Setting("Playhead follows cursor", state.scrubFollow, EditorShortcut.TOGGLE_SCRUB)
+            Setting("Safe-area guides", state.safeGuidesOn, onToggle = onToggleSafeGuides)
+            Setting("Checkerboard background", state.checkerboardOn, onToggle = onToggleChecker)
+            Setting("Light theme", state.isLightTheme, EditorShortcut.TOGGLE_THEME)
+
+            SectionHeader("PROJECT")
+            Tool("Save now", EditorShortcut.SAVE)
+            Tool("Export project file (.filmcraft)", EditorShortcut.EXPORT_PROJECT_FILE)
+            Tool("Import project file", EditorShortcut.OPEN_PROJECT_FILE)
+            Tool("Preset packs · import / export", EditorShortcut.PRESETS)
+            Tool("Back to all projects", EditorShortcut.HOME)
             InspectorActionButton("Project health scan") { onDismiss(); onHealthScan() }
+            InspectorActionButton("Select unused media") { onDismiss(); onSelectUnusedMedia() }
             InspectorActionButton("Clear timeline") { onDismiss(); onClearTimeline() }
         }
     }
@@ -1644,78 +2005,296 @@ fun AgentAccessDialog(
     }
 }
 
-/** Reference sheet for the keyboard and mouse bindings that actually work. */
+/**
+ * The key map, and the place to change it. Every keyboard action is listed with the keys bound to
+ * it; Change waits for the next key press and binds it. A key already used elsewhere is only
+ * taken over after a confirmation, so nothing is rebound by accident.
+ */
 @Composable
-fun ShortcutsDialog(onDismiss: () -> Unit) {
+fun ShortcutsDialog(
+    bindings: ShortcutBindings,
+    onRebind: (EditorShortcut, String) -> Unit,
+    onResetOne: (EditorShortcut) -> Unit,
+    onResetAll: () -> Unit,
+    onDismiss: () -> Unit
+) {
     val palette = LocalEditProPalette.current
-    val entries = listOf(
-        "Play / pause" to "Space",
-        "Split at playhead" to "S",
-        "Delete selected clips" to "Delete / Backspace",
-        "Ripple delete" to "Shift+Delete",
-        "Undo / redo" to "Ctrl+Z / Ctrl+Shift+Z",
-        "Duplicate clip" to "Ctrl+D",
-        "Add marker" to "Ctrl+M",
-        "Add text clip" to "T",
-        "Step 0.1s" to "Left / Right arrow",
-        "Toggle grade split" to "Backslash",
-        "New project" to "Ctrl+N",
-        "Open project" to "Ctrl+O",
-        "Save project" to "Ctrl+S",
-        "Export video" to "Ctrl+E",
-        "Import media" to "Ctrl+I",
-        "Tools panel" to "Ctrl+K",
-        "Preset packs" to "Ctrl+Alt+P",
-        "Workspace modes" to "Alt+1 to Alt+4",
-        "Toggle scopes" to "Alt+S",
-        "Playhead follows cursor" to "Alt+F",
-        "Light / dark theme" to "Alt+L",
-        "Clip context menu" to "Right-click or long-press"
-    )
+    var capturing by remember { mutableStateOf<EditorShortcut?>(null) }
+    var conflict by remember { mutableStateOf<Triple<EditorShortcut, String, EditorShortcut>?>(null) }
+    var query by remember { mutableStateOf("") }
+    val captureFocus = remember { FocusRequester() }
+
     Dialog(onDismissRequest = onDismiss) {
         Column(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier
+                .widthIn(max = 560.dp)
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(16.dp))
                 .background(palette.panel)
                 .border(0.5.dp, palette.line, RoundedCornerShape(16.dp))
                 .padding(18.dp)
+                .focusRequester(captureFocus)
+                .focusable()
+                .onPreviewKeyEvent { ev ->
+                    val target = capturing ?: return@onPreviewKeyEvent false
+                    if (ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent true
+                    // Ctrl, Shift and Alt on their own are not a shortcut yet: keep waiting.
+                    val name = chordKeyName(ev.key.nativeKeyCode) ?: return@onPreviewKeyEvent true
+                    val ctrl = ev.isCtrlPressed || ev.isMetaPressed
+                    if (name == "Escape" && !ctrl && !ev.isAltPressed && !ev.isShiftPressed) {
+                        capturing = null
+                        return@onPreviewKeyEvent true
+                    }
+                    val chord = ShortcutChords.of(name, ctrl = ctrl, alt = ev.isAltPressed, shift = ev.isShiftPressed)
+                    val holder = bindings.resolve(chord)
+                    if (holder != null && holder != target) conflict = Triple(target, chord, holder)
+                    else onRebind(target, chord)
+                    capturing = null
+                    true
+                }
         ) {
+            Text("Keyboard shortcuts", color = palette.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Text(
-                "Keyboard & mouse shortcuts",
-                color = palette.text,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-            Text(
-                "Ctrl also responds to the Meta key. Shortcuts are ignored while a text field has focus.",
+                "Press Change, then the keys you want. Ctrl also answers to the Meta (Cmd) key, and " +
+                    "shortcuts stand aside while you type in a text field. Right-click or long-press a clip, " +
+                    "a track name, a marker or empty timeline space for its menu.",
                 color = palette.muted,
                 fontSize = 11.5.sp
             )
+            BasicTextField(
+                value = query,
+                onValueChange = { query = it },
+                singleLine = true,
+                textStyle = TextStyle(color = palette.text, fontSize = 12.5.sp),
+                cursorBrush = SolidColor(palette.accent),
+                decorationBox = { inner ->
+                    Box(
+                        contentAlignment = Alignment.CenterStart,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(34.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(palette.controlBg)
+                            .padding(horizontal = 10.dp)
+                    ) {
+                        if (query.isEmpty()) Text("Search actions or keys…", color = palette.muted, fontSize = 12.5.sp)
+                        inner()
+                    }
+                }
+            )
+
+            conflict?.let { (action, chord, holder) ->
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(palette.orange.copy(alpha = 0.16f))
+                        .border(0.5.dp, palette.orange.copy(alpha = 0.6f), RoundedCornerShape(9.dp))
+                        .padding(10.dp)
+                ) {
+                    Text(
+                        "${ShortcutChords.pretty(chord)} already runs \"${holder.label}\". " +
+                            "Use it for \"${action.label}\" instead?",
+                        color = palette.text,
+                        fontSize = 12.sp
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        InspectorActionButton("Keep as it is", modifier = Modifier.weight(1f)) { conflict = null }
+                        InspectorActionButton("Reassign", isPrimary = true, modifier = Modifier.weight(1f)) {
+                            onRebind(action, chord)
+                            conflict = null
+                        }
+                    }
+                }
+            }
+
             Column(
                 verticalArrangement = Arrangement.spacedBy(4.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = minOf(380.dp, rememberDialogMaxHeight()))
+                    .heightIn(max = minOf(420.dp, rememberDialogMaxHeight() - 200.dp))
                     .verticalScroll(rememberScrollState())
             ) {
-                entries.forEach { (label, keys) ->
-                    Row(
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(7.dp))
-                            .background(palette.controlBg)
-                            .padding(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Text(label, color = palette.text, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                        Text(keys, color = palette.accent, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
+                val needle = query.trim()
+                EditorShortcut.groups.forEach { group ->
+                    val rows = EditorShortcut.entries.filter { action ->
+                        action.group == group && (
+                            needle.isEmpty() ||
+                                action.label.contains(needle, ignoreCase = true) ||
+                                bindings.display(action).contains(needle, ignoreCase = true)
+                            )
+                    }
+                    if (rows.isNotEmpty()) SectionHeader(group.uppercase())
+                    rows.forEach { action ->
+                        val waiting = capturing == action
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(7.dp))
+                                .background(if (waiting) palette.accent.copy(alpha = 0.22f) else palette.controlBg)
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                action.label,
+                                color = palette.text,
+                                fontSize = 12.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = if (waiting) "Press keys… (Esc cancels)" else bindings.display(action),
+                                color = if (bindings.isCustom(action) && !waiting) palette.orange else palette.accent,
+                                fontSize = 11.5.sp,
+                                fontFamily = FontFamily.Monospace,
+                                maxLines = 1
+                            )
+                            ShortcutRowButton(if (waiting) "Cancel" else "Change") {
+                                if (waiting) {
+                                    capturing = null
+                                } else {
+                                    conflict = null
+                                    capturing = action
+                                    runCatching { captureFocus.requestFocus() }
+                                }
+                            }
+                            if (bindings.isCustom(action)) {
+                                ShortcutRowButton("Reset") { onResetOne(action) }
+                            } else if (bindings.chords(action).isNotEmpty()) {
+                                ShortcutRowButton("Clear") { onRebind(action, "") }
+                            }
+                        }
                     }
                 }
             }
-            InspectorActionButton("Done", isPrimary = true, onClick = onDismiss)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                InspectorActionButton("Reset all to defaults", modifier = Modifier.weight(1f), onClick = onResetAll)
+                InspectorActionButton("Done", isPrimary = true, modifier = Modifier.weight(1f), onClick = onDismiss)
+            }
         }
     }
+}
+
+@Composable
+private fun ShortcutRowButton(label: String, onClick: () -> Unit) {
+    val palette = LocalEditProPalette.current
+    Text(
+        text = label,
+        color = palette.text,
+        fontSize = 10.5.sp,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(palette.panel2)
+            .border(0.5.dp, palette.line, RoundedCornerShape(6.dp))
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 6.dp)
+    )
+}
+
+/**
+ * The motion-graphics picker. Each entry shows a frame of the real graphic, drawn by the same
+ * renderer the preview and the export use. Picking one adds it at the playhead as an ordinary
+ * clip, ready to be retyped, recoloured, trimmed and keyframed.
+ */
+@Composable
+fun MotionGraphicsDialog(
+    onPick: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val palette = LocalEditProPalette.current
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier
+                .widthIn(max = 520.dp)
+                .fillMaxWidth()
+                .heightIn(max = minOf(620.dp, rememberDialogMaxHeight()))
+                .clip(RoundedCornerShape(16.dp))
+                .background(palette.panel)
+                .border(0.5.dp, palette.line, RoundedCornerShape(16.dp))
+                .padding(16.dp)
+        ) {
+            Row(
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Motion graphics", color = palette.text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Text("✕", color = palette.muted, modifier = Modifier.clickable(onClick = onDismiss).padding(6.dp))
+            }
+            Text(
+                "Pick one to add it at the playhead. It becomes a normal clip: change its text and colours in " +
+                    "the inspector, drag its edges to retime it, and keyframe it like anything else.",
+                color = palette.muted,
+                fontSize = 12.sp
+            )
+            Column(
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())
+            ) {
+                MotionGraphics.categories.forEach { category ->
+                    SectionHeader(category.uppercase())
+                    MotionGraphics.templates.filter { it.category == category }.forEach { template ->
+                        val preview = remember(template.id) { renderGraphicPreview(template) }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(9.dp))
+                                .background(palette.controlBg)
+                                .clickable(role = Role.Button) { onPick(template.id) }
+                                .padding(6.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .width(112.dp)
+                                    .height(63.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(Color(0xFF10151F))
+                            ) {
+                                if (preview != null) {
+                                    androidx.compose.foundation.Image(
+                                        bitmap = preview,
+                                        contentDescription = null,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(template.title, color = palette.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                Text(template.description, color = palette.muted, fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** One representative frame of a template, a little past the middle of its run. */
+private fun renderGraphicPreview(template: MgTemplate): androidx.compose.ui.graphics.ImageBitmap? = try {
+    val width = 320
+    val height = 180
+    val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+    val canvas = android.graphics.Canvas(bitmap)
+    val backdrop = android.graphics.Paint().apply {
+        shader = android.graphics.LinearGradient(
+            0f, 0f, width.toFloat(), height.toFloat(),
+            android.graphics.Color.parseColor("#2a3f66"), android.graphics.Color.parseColor("#141b2b"),
+            android.graphics.Shader.TileMode.CLAMP
+        )
+    }
+    canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), backdrop)
+    val clip = MotionGraphics.createClip(template, 0.0, 10.0)
+    val duration = TimelineEngine.clipDuration(clip, emptyMap())
+    TitleRenderer.drawClip(canvas, width, height, clip, duration * 0.6, duration)
+    bitmap.asImageBitmap()
+} catch (_: Exception) {
+    null
 }

@@ -12,7 +12,9 @@ data class ProjectDocument(
     val settings: ProjectSettings,
     val clips: List<TimelineClip>,
     val markers: List<TimelineMarker>,
-    val assets: List<MediaAsset>
+    val assets: List<MediaAsset>,
+    /** Per-track lock / hide / mute / solo / collapse. Empty for files written before version 3. */
+    val trackStates: Map<TimelineTrack, TrackState> = emptyMap()
 )
 
 data class UniversalPresetBundle(
@@ -32,11 +34,15 @@ object ProjectSerializer {
         settings: ProjectSettings,
         clips: List<TimelineClip>,
         markers: List<TimelineMarker>,
-        assets: List<MediaAsset>
+        assets: List<MediaAsset>,
+        trackStates: Map<TimelineTrack, TrackState> = emptyMap()
     ): String {
         val root = JSONObject()
         root.put("format", "filmcraft-project")
-        root.put("version", 2)
+        // Version 3 adds optional fields only (track states, motion graphics, per-keyframe easing,
+        // waveform and filmstrip caches). Version 2 files still open, and a version 2 reader
+        // simply ignores what it does not know.
+        root.put("version", 3)
         root.put("name", name)
         root.put("createdAt", Instant.now().toString())
         root.put("settings", JSONObject().apply {
@@ -69,9 +75,30 @@ object ProjectSerializer {
                     if (a.colorHex != null) put("color", a.colorHex)
                     if (a.uriString != null) put("uriString", a.uriString)
                     if (a.localPath != null) put("localPath", a.localPath)
+                    if (a.durationGuess) put("durationGuess", true)
+                    // Cached so reopening a project does not lose its waveforms and thumbnails.
+                    if (a.waveformPeaks.isNotEmpty()) {
+                        put("waveform", JSONArray().apply {
+                            a.waveformPeaks.forEach { peak -> put(Math.round(peak * 1000f) / 1000.0) }
+                        })
+                    }
+                    if (a.filmstripPaths.isNotEmpty()) put("filmstrip", JSONArray(a.filmstripPaths))
                 })
             }
         })
+        if (trackStates.isNotEmpty()) {
+            root.put("tracks", JSONObject().apply {
+                trackStates.forEach { (track, ts) ->
+                    put(track.key, JSONObject().apply {
+                        put("locked", ts.locked)
+                        put("hidden", ts.hidden)
+                        put("muted", ts.muted)
+                        put("solo", ts.solo)
+                        put("collapsed", ts.collapsed)
+                    })
+                }
+            })
+        }
         root.put("note", "Portable EditPro / Filmcraft edit decision list.")
         return root.toString(2)
     }
@@ -114,16 +141,36 @@ object ProjectSerializer {
                     favorite = it.optBoolean("favorite", false),
                     colorHex = it.optString("color").takeIf { c -> c.isNotEmpty() },
                     uriString = it.optString("uriString").takeIf { u -> u.isNotEmpty() },
-                    localPath = it.optString("localPath").takeIf { p -> p.isNotEmpty() }
+                    localPath = it.optString("localPath").takeIf { p -> p.isNotEmpty() },
+                    durationGuess = it.optBoolean("durationGuess", false),
+                    waveformPeaks = it.optJSONArray("waveform")?.let { arr ->
+                        (0 until arr.length()).map { i -> arr.optDouble(i, 0.0).toFloat() }
+                    } ?: emptyList(),
+                    filmstripPaths = it.optJSONArray("filmstrip")?.let { arr ->
+                        (0 until arr.length()).map { i -> arr.optString(i, "") }.filter { p -> p.isNotEmpty() }
+                    } ?: emptyList()
                 )
             }
         }
+        val tracksObj = obj.optJSONObject("tracks")
+        val trackStates = if (tracksObj == null) emptyMap() else TimelineTrack.entries.mapNotNull { track ->
+            tracksObj.optJSONObject(track.key)?.let { t ->
+                track to TrackState(
+                    locked = t.optBoolean("locked", false),
+                    hidden = t.optBoolean("hidden", false),
+                    muted = t.optBoolean("muted", false),
+                    solo = t.optBoolean("solo", false),
+                    collapsed = t.optBoolean("collapsed", false)
+                )
+            }
+        }.toMap()
         return ProjectDocument(
             name = name,
             settings = settings,
             clips = clips,
             markers = markers,
-            assets = assets
+            assets = assets,
+            trackStates = trackStates
         )
     }
 
@@ -174,6 +221,10 @@ object ProjectSerializer {
         put("audioDeess", c.audioDeess)
         put("audioReverb", c.audioReverb)
         put("label", c.label)
+        if (c.graphic.isNotEmpty()) put("graphic", c.graphic)
+        put("accentColor", c.accentColor)
+        put("boxW", c.boxW)
+        put("boxH", c.boxH)
         put("keyframes", JSONArray().apply {
             c.keyframes.forEach { k ->
                 put(JSONObject().apply {
@@ -184,6 +235,7 @@ object ProjectSerializer {
                     put("x", k.x)
                     put("y", k.y)
                     put("filters", filtersToJson(k.filters))
+                    if (k.easing.isNotEmpty()) put("easing", k.easing)
                 })
             }
         })
@@ -220,7 +272,8 @@ object ProjectSerializer {
                     rotation = k.optDouble("rotation", 0.0),
                     x = k.optDouble("x", 0.0),
                     y = k.optDouble("y", 0.0),
-                    filters = jsonToFilters(k.optJSONObject("filters"))
+                    filters = jsonToFilters(k.optJSONObject("filters")),
+                    easing = k.optString("easing", "")
                 )
             }
         }
@@ -282,7 +335,11 @@ object ProjectSerializer {
             audioReverb = o.optDouble("audioReverb", 0.0),
             keyframes = keyframes,
             volumeKeyframes = volumeKeyframes,
-            label = o.optString("label", "Clip")
+            label = o.optString("label", "Clip"),
+            graphic = o.optString("graphic", ""),
+            accentColor = o.optString("accentColor", "#0a84ff"),
+            boxW = o.optDouble("boxW", 40.0),
+            boxH = o.optDouble("boxH", 40.0)
         )
     }
 

@@ -9,6 +9,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -40,9 +41,15 @@ fun DraggableTimecode(
     color: Color = LocalEditProPalette.current.accent,
     fontSize: TextUnit = 12.sp,
     background: Color = Color.Transparent,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    /** Called once when a drag begins — the place to take an undo snapshot. */
+    onDragStart: () -> Unit = {}
 ) {
     var dragging by remember { mutableStateOf(false) }
+    // The gesture block outlives recompositions; without these it would keep calling the
+    // callbacks it was first given, which for a playhead readout means seeking from a stale time.
+    val currentOnDelta by rememberUpdatedState(onDelta)
+    val currentOnDragStart by rememberUpdatedState(onDragStart)
 
     Text(
         text = formatTimecode(seconds),
@@ -56,13 +63,16 @@ fun DraggableTimecode(
                 if (enabled) {
                     Modifier.pointerInput(secondsPerDp) {
                         detectHorizontalDragGestures(
-                            onDragStart = { dragging = true },
+                            onDragStart = {
+                                dragging = true
+                                currentOnDragStart()
+                            },
                             onDragEnd = { dragging = false },
                             onDragCancel = { dragging = false }
                         ) { change, dragAmount ->
                             change.consume()
                             val dp = dragAmount / density
-                            if (dp != 0f) onDelta(dp * secondsPerDp)
+                            if (dp != 0f) currentOnDelta(dp * secondsPerDp)
                         }
                     }
                 } else {

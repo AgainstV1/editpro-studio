@@ -2,16 +2,19 @@ package com.editpro.studio.media
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
+import android.media.ExifInterface
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -418,6 +421,51 @@ object MediaEngine {
         FileOutputStream(outputFile).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
         bmp.recycle()
         return outputFile
+    }
+
+    /**
+     * Decodes a still image no larger than it needs to be and the right way up.
+     *
+     * A phone photo is often 12 megapixels or more; decoding it whole costs ~48 MB per image, so
+     * the file is sub-sampled until it is just above [maxWidth] x [maxHeight]. The EXIF
+     * orientation is applied as well, because `BitmapFactory` ignores it and portrait photos
+     * otherwise come out lying on their side.
+     */
+    fun decodeStill(path: String, maxWidth: Int, maxHeight: Int): Bitmap? {
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= max(1, maxWidth) && bounds.outHeight / (sample * 2) >= max(1, maxHeight)) {
+                sample *= 2
+            }
+            val decoded = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
+                ?: return null
+            val orientation = try {
+                ExifInterface(path).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            } catch (_: Exception) {
+                ExifInterface.ORIENTATION_NORMAL
+            }
+            val m = Matrix()
+            when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> m.postRotate(90f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> m.postRotate(180f)
+                ExifInterface.ORIENTATION_ROTATE_270 -> m.postRotate(270f)
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> m.postScale(-1f, 1f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> m.postScale(1f, -1f)
+                ExifInterface.ORIENTATION_TRANSPOSE -> { m.postRotate(90f); m.postScale(-1f, 1f) }
+                ExifInterface.ORIENTATION_TRANSVERSE -> { m.postRotate(270f); m.postScale(-1f, 1f) }
+                else -> return decoded
+            }
+            val turned = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, m, true)
+            if (turned !== decoded) decoded.recycle()
+            turned
+        } catch (_: Exception) {
+            null
+        } catch (_: OutOfMemoryError) {
+            null
+        }
     }
 
     /**

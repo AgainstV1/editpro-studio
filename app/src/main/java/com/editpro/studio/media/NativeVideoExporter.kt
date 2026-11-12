@@ -2,7 +2,6 @@ package com.editpro.studio.media
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Camera
 import android.graphics.Canvas
 import android.graphics.Color
@@ -14,7 +13,6 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
-import android.graphics.Typeface
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -40,6 +38,14 @@ import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
+/**
+ * Supplies decoded video frames to the compositor. The preview uses one so it can keep and
+ * reuse the frame it already has; the caller owns the bitmap it returns.
+ */
+fun interface VideoFrameSource {
+    fun frameAt(clip: TimelineClip, asset: MediaAsset, timeUs: Long): Bitmap?
+}
+
 data class ExportResult(
     val success: Boolean,
     val outputFile: File? = null,
@@ -49,10 +55,11 @@ data class ExportResult(
 object NativeVideoExporter {
 
     /**
-     * Renders the multi-track EditPro timeline to an H.264 MP4 file using Android's native
-     * hardware `MediaCodec` + `MediaMuxer` pipeline, compositing all visual layers (VIDEO 1,
-     * VIDEO 2, OVERLAY, TEXT & TITLES), keyframe animations, 3-Way Color Wheels, 3D Camera Rigs,
-     * transitions, vignette, and film grain.
+     * Renders the timeline to an H.264 MP4 with Android's own `MediaCodec` + `MediaMuxer`.
+     * Every frame comes from [renderCompositeFrame] — the same compositor the preview uses — so
+     * the picture layers, keyframe animation, grade, camera rig, fades, vignette, motion graphics
+     * and titles match what was on screen while editing. The audio track is mixed by
+     * [TimelineAudioEncoder].
      */
     suspend fun exportProjectToMp4(
         context: Context,
@@ -72,12 +79,12 @@ object NativeVideoExporter {
                 assetsById.containsKey(rc.clip.assetId)
         }
         val visibleTexts = started.filter { rc ->
-            rc.clip.track == TimelineTrack.TEXT && trackStates[rc.clip.track]?.hidden != true
+            rc.clip.track.isTitle && trackStates[rc.clip.track]?.hidden != true
         }
         if (visibleVisuals.isEmpty() && visibleTexts.isEmpty()) {
             return@withContext ExportResult(
                 success = false,
-                message = "Add at least one visible video, image, or text clip before exporting."
+                message = "Add at least one visible video, image, text or graphics clip before exporting."
             )
         }
 
@@ -110,7 +117,8 @@ object NativeVideoExporter {
                 val asset = assetsById[rc.clip.assetId] ?: continue
                 val path = asset.localPath ?: continue
                 if (asset.kind == AssetKind.IMAGE && !bitmapCache.containsKey(asset.id)) {
-                    BitmapFactory.decodeFile(path)?.let { bitmapCache[asset.id] = it }
+                    // Twice the frame leaves room to zoom in without softening the picture.
+                    MediaEngine.decodeStill(path, width * 2, height * 2)?.let { bitmapCache[asset.id] = it }
                 } else if (asset.kind == AssetKind.VIDEO && !videoRetrievers.containsKey(asset.id)) {
                     val ret = MediaMetadataRetriever()
                     try {
@@ -282,8 +290,12 @@ object NativeVideoExporter {
     }
 
     /**
-     * Renders a single composite timeline frame onto any Android `Canvas` (used both for
-     * `captureFrame()` PNG export and `NativeVideoExporter` frame rendering).
+     * Draws one frame of the timeline onto any Android `Canvas`. This is the single compositor:
+     * the exporter calls it for every output frame and the preview ([PreviewCompositor]) calls it
+     * for what is on screen, so the two cannot drift apart.
+     *
+     * Video frames come from [videoFrames] when one is given, otherwise straight from
+     * [videoRetrievers].
      */
     fun renderCompositeFrame(
         canvas: Canvas,
@@ -295,19 +307,22 @@ object NativeVideoExporter {
         trackStates: Map<TimelineTrack, TrackState>,
         bitmapCache: Map<String, Bitmap>,
         videoRetrievers: Map<String, MediaMetadataRetriever>,
-        checkerboard: Boolean = false
+        checkerboard: Boolean = false,
+        videoFrames: VideoFrameSource? = null
     ) {
         val bgPaint = Paint().apply {
             color = if (checkerboard) Color.parseColor("#27272b") else Color.parseColor("#050608")
         }
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
 
+        val projectEnd = allResolved.maxOfOrNull { it.end } ?: 0.0
+        // Layer order is the track order (VIDEO 1 at the bottom, OVERLAY on top), not the order
+        // the clips happen to start in.
         val activeVisuals = allResolved.filter { rc ->
             rc.clip.track.isVisual &&
                 trackStates[rc.clip.track]?.hidden != true &&
-                playheadSec >= rc.start &&
-                playheadSec <= rc.end
-        }
+                TimelineEngine.isActiveAt(rc, playheadSec, projectEnd)
+        }.sortedBy { it.clip.track.ordinal }
 
         var maxVignette = 0.0
         for (rc in activeVisuals) {
@@ -382,10 +397,18 @@ object NativeVideoExporter {
                 }
                 AssetKind.VIDEO -> {
                     val ret = videoRetrievers[asset.id]
-                    if (ret != null) {
-                        val targetUs = max(0L, ((c.trimIn + localT * c.speed) * 1_000_000.0).toLong())
+                    val targetUs = max(0L, ((c.trimIn + localT * c.speed) * 1_000_000.0).toLong())
+                    if (videoFrames != null) {
+                        videoFrames.frameAt(c, asset, targetUs)?.let {
+                            drawContainedBitmap(canvas, it, width, height, layerPaint)
+                        }
+                    } else if (ret != null) {
+                        // The exact frame, not the nearest key frame: key frames are often a
+                        // second apart, which turned exported motion into a slideshow. The key
+                        // frame is only a fallback for the odd position a decoder cannot reach.
                         val vBmp = try {
-                            ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                ?: ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                         } catch (_: Exception) {
                             null
                         }
@@ -415,71 +438,8 @@ object NativeVideoExporter {
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), vigPaint)
         }
 
-        // Text & Titles track
-        val activeTexts = allResolved.filter { rc ->
-            rc.clip.track == TimelineTrack.TEXT &&
-                trackStates[TimelineTrack.TEXT]?.hidden != true &&
-                playheadSec >= rc.start &&
-                playheadSec <= rc.end
-        }
-        for (rc in activeTexts) {
-            val c = rc.clip
-            val localT = playheadSec - rc.start
-            val anim = TimelineEngine.animatedProps(c, localT)
-            val alphaInt = ((anim.opacity / 100.0) * 255.0).roundToInt().coerceIn(0, 255)
-            val scaleFactor = min(width / 1280f, height / 720f)
-            val pxSize = max(10f, c.fontSize * (anim.scale.toFloat() / 100f) * scaleFactor)
-
-            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = try { Color.parseColor(c.textColor) } catch (_: Exception) { Color.WHITE }
-                alpha = alphaInt
-                textSize = pxSize
-                typeface = Typeface.create(
-                    when (c.fontFamily) {
-                        "monospace" -> Typeface.MONOSPACE
-                        "serif", "Georgia" -> Typeface.SERIF
-                        else -> Typeface.SANS_SERIF
-                    },
-                    if (c.fontWeight >= 700) Typeface.BOLD else Typeface.NORMAL
-                )
-                textAlign = when (c.textAlign) {
-                    "left" -> Paint.Align.LEFT
-                    "right" -> Paint.Align.RIGHT
-                    else -> Paint.Align.CENTER
-                }
-                if (c.shadow) {
-                    setShadowLayer(pxSize * 0.18f, 0f, pxSize * 0.05f, Color.argb(200, 0, 0, 0))
-                }
-            }
-
-            val lines = c.text.ifEmpty { "Text" }.split("\n")
-            val lineH = pxSize * 1.18f
-            val baseX = when (c.textAlign) {
-                "left" -> width * 0.08f
-                "right" -> width * 0.92f
-                else -> width / 2f
-            } + ((anim.x / 100.0) * width).toFloat()
-
-            var baseY = when (c.verticalPosition) {
-                "top" -> height * 0.18f - (lines.size - 1) * lineH / 2f
-                "bottom" -> height * 0.82f - (lines.size - 1) * lineH / 2f
-                else -> height / 2f - (lines.size - 1) * lineH / 2f
-            } + ((anim.y / 100.0) * height).toFloat()
-
-            for (line in lines) {
-                if (c.strokeWidth > 0f) {
-                    val strokePaint = Paint(textPaint).apply {
-                        style = Paint.Style.STROKE
-                        strokeWidth = c.strokeWidth * scaleFactor * 2f
-                        color = try { Color.parseColor(c.strokeColor) } catch (_: Exception) { Color.BLACK }
-                        alpha = alphaInt
-                    }
-                    canvas.drawText(line, baseX, baseY, strokePaint)
-                }
-                canvas.drawText(line, baseX, baseY, textPaint)
-                baseY += lineH
-            }
-        }
+        // Motion graphics and titles, drawn by the renderer the preview also uses.
+        TitleRenderer.drawTitles(canvas, width, height, playheadSec, allResolved, trackStates)
     }
 
     private fun drawContainedBitmap(canvas: Canvas, bmp: Bitmap, stageW: Int, stageH: Int, paint: Paint) {

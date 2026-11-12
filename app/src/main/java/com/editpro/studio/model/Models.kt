@@ -24,12 +24,17 @@ enum class TimelineTrack(
     val key: String,
     val label: String,
     val isVisual: Boolean,
-    val isAudio: Boolean
+    val isAudio: Boolean,
+    /** Title-like tracks hold text and motion-graphics clips (no media asset behind them). */
+    val isTitle: Boolean = false
 ) {
     VIDEO("video", "VIDEO 1", isVisual = true, isAudio = false),
     VIDEO2("video2", "VIDEO 2", isVisual = true, isAudio = false),
     OVERLAY("overlay", "OVERLAY", isVisual = true, isAudio = false),
-    TEXT("text", "TEXT & TITLES", isVisual = false, isAudio = false),
+    // Drawn above every visual track and below TEXT, so a lower third or a letterbox can run
+    // underneath subtitles for the whole edit.
+    GRAPHICS("graphics", "GRAPHICS", isVisual = false, isAudio = false, isTitle = true),
+    TEXT("text", "TEXT & TITLES", isVisual = false, isAudio = false, isTitle = true),
     AUDIO("audio", "AUDIO 1", isVisual = false, isAudio = true),
     AUDIO2("audio2", "AUDIO 2", isVisual = false, isAudio = true);
 
@@ -71,7 +76,9 @@ data class TrackState(
     val locked: Boolean = false,
     val hidden: Boolean = false,
     val muted: Boolean = false,
-    val solo: Boolean = false
+    val solo: Boolean = false,
+    /** Collapsed tracks shrink to a thin strip in the timeline; they still play and export. */
+    val collapsed: Boolean = false
 )
 
 data class MediaAsset(
@@ -134,7 +141,13 @@ data class Keyframe(
     val rotation: Double = 0.0,
     val x: Double = 0.0,
     val y: Double = 0.0,
-    val filters: ClipFilters = ClipFilters()
+    val filters: ClipFilters = ClipFilters(),
+    /**
+     * Easing of the segment that starts at this keyframe: "linear", "ease", "in", "out" or
+     * "hold". Empty means "use the clip's bezier velocity curve", which is what every keyframe
+     * did before per-keyframe easing existed.
+     */
+    val easing: String = ""
 )
 
 data class VolumePoint(
@@ -190,8 +203,18 @@ data class TimelineClip(
     val audioReverb: Double = 0.0,
     val keyframes: List<Keyframe> = emptyList(),
     val volumeKeyframes: List<VolumePoint> = emptyList(),
-    val label: String = "Clip"
-)
+    val label: String = "Clip",
+    /** Motion-graphics template id (see [MotionGraphics]); empty for ordinary clips. */
+    val graphic: String = "",
+    /** Secondary colour used by motion graphics for plates, bars and accents. */
+    val accentColor: String = "#0a84ff",
+    /** Width / height of a shape graphic, in percent of the frame. */
+    val boxW: Double = 40.0,
+    val boxH: Double = 40.0
+) {
+    /** True for a motion-graphics clip, which is drawn procedurally instead of from text or media. */
+    val isGraphic: Boolean get() = graphic.isNotEmpty()
+}
 
 data class ResolvedClip(
     val clip: TimelineClip,
@@ -270,7 +293,9 @@ data class EditorSnapshot(
     val selectedClipId: String?,
     val projectName: String,
     val duration: Double,
-    val settings: ProjectSettings
+    val settings: ProjectSettings,
+    val assets: List<MediaAsset> = emptyList(),
+    val selectedClipIds: Set<String> = emptySet()
 )
 
 fun generateUid(): String = UUID.randomUUID().toString().replace("-", "").take(16)
@@ -310,7 +335,10 @@ object TimelineEngine {
     fun starts(clips: List<TimelineClip>, assetsById: Map<String, MediaAsset>): List<ResolvedClip> {
         var cursor = 0.0
         return clips.map { c ->
-            val dur = sourceSpanDuration(c, assetsById)
+            // Speed-aware: a 2x clip occupies half its source span. The exporter and the audio
+            // mixer already read the source at `speed`, so using the raw span here made a
+            // retimed clip run past its out-point.
+            val dur = clipDuration(c, assetsById)
             val st = if (c.startAt.isFinite()) max(0.0, c.startAt) else cursor
             cursor = max(cursor, st + dur)
             ResolvedClip(clip = c, start = st, duration = dur)
@@ -320,6 +348,37 @@ object TimelineEngine {
     fun calcProjectDuration(clips: List<TimelineClip>, assetsById: Map<String, MediaAsset>): Double {
         return starts(clips, assetsById).maxOfOrNull { it.end } ?: 0.0
     }
+
+    /**
+     * Whether a clip is on screen at [timeSec]. A clip owns its first frame but not its last
+     * instant, so two clips that meet at a cut are never both drawn; the one exception is the
+     * very end of the project, where the final clip stays visible instead of going black.
+     */
+    fun isActiveAt(rc: ResolvedClip, timeSec: Double, projectEnd: Double): Boolean {
+        val eps = 1e-6
+        if (timeSec < rc.start - eps) return false
+        if (timeSec < rc.end - eps) return true
+        return timeSec <= rc.end + eps && rc.end >= projectEnd - eps
+    }
+
+    /**
+     * Tracks whose sound should be heard. Mute and hide silence a track; when any track is
+     * soloed, only soloed tracks play. Picture tracks count too, because a video clip carries
+     * its own sound.
+     */
+    fun audibleTracks(trackStates: Map<TimelineTrack, TrackState>): Set<TimelineTrack> {
+        val candidates = TimelineTrack.entries.filter { it.isAudio || it.isVisual }
+        val anySolo = candidates.any { trackStates[it]?.solo == true }
+        return candidates.filter { track ->
+            val ts = trackStates[track] ?: TrackState()
+            !ts.muted && !ts.hidden && (!anySolo || ts.solo)
+        }.toSet()
+    }
+
+    /** True when the clip can produce sound: an audio file, or a video (which may have a soundtrack). */
+    fun carriesSound(clip: TimelineClip, asset: MediaAsset?): Boolean =
+        asset != null && (clip.track.isAudio || clip.track.isVisual) &&
+            (asset.kind == AssetKind.AUDIO || asset.kind == AssetKind.VIDEO)
 
     /**
      * Exact native port of EditPro's `resolveTimelineStart`:
@@ -336,7 +395,9 @@ object TimelineEngine {
         allClips: List<TimelineClip>,
         assetsById: Map<String, MediaAsset>,
         playhead: Double,
-        magneticSnap: Boolean
+        magneticSnap: Boolean,
+        /** Further snap targets, e.g. markers and clip edges on other tracks. */
+        extraSnapTimes: List<Double> = emptyList()
     ): Double {
         var s = max(0.0, desired)
         val others = starts(allClips, assetsById)
@@ -351,6 +412,11 @@ object TimelineEngine {
                 candidates.add(SnapCandidate(q.end, abs((s - q.end) * scalePxPerSec)))
             }
             candidates.add(SnapCandidate(playhead, abs((s - playhead) * scalePxPerSec)))
+            // Either edge of the moving clip may land on an extra target.
+            for (t in extraSnapTimes) {
+                candidates.add(SnapCandidate(t, abs((s - t) * scalePxPerSec)))
+                candidates.add(SnapCandidate(t - duration, abs((s + duration - t) * scalePxPerSec)))
+            }
             val best = candidates.filter { it.distPx <= 11.0 }.minByOrNull { it.distPx }
             if (best != null) {
                 s = max(0.0, best.start)
@@ -392,6 +458,15 @@ object TimelineEngine {
         return 3.0 * inv * inv * s * y1 + 3.0 * inv * s * s * y2 + s * s * s
     }
 
+    /** Named easing curves for a normalised progress value; unknown names are linear. */
+    fun applyEasing(name: String, u: Double): Double = when (name) {
+        "ease" -> u * u * (3.0 - 2.0 * u)
+        "in" -> u * u
+        "out" -> 1.0 - (1.0 - u) * (1.0 - u)
+        "hold" -> 0.0
+        else -> u
+    }
+
     /**
      * Evaluates keyframe-interpolated transform and filter properties at clip-local time `localTimeSec`.
      */
@@ -430,16 +505,13 @@ object TimelineEngine {
         if (right == null) return toProps(left)
 
         var u = ((localTimeSec - left.time) / max(0.001, right.time - left.time)).coerceIn(0.0, 1.0)
-        if (clip.bezier.size == 4 && clip.ease == "ease") {
-            u = evalCubicBezier(u, clip.bezier[0], clip.bezier[1], clip.bezier[2], clip.bezier[3])
+        // The keyframe that starts the segment decides how it eases; without its own easing it
+        // falls back to the clip-wide curve.
+        val segmentEase = left.easing.ifEmpty { clip.ease }
+        u = if (left.easing.isEmpty() && clip.bezier.size == 4 && clip.ease == "ease") {
+            evalCubicBezier(u, clip.bezier[0], clip.bezier[1], clip.bezier[2], clip.bezier[3])
         } else {
-            u = when (clip.ease) {
-                "ease" -> u * u * (3.0 - 2.0 * u)
-                "in" -> u * u
-                "out" -> 1.0 - (1.0 - u) * (1.0 - u)
-                "hold" -> 0.0
-                else -> u
-            }
+            applyEasing(segmentEase, u)
         }
 
         fun lerp(a: Double, b: Double): Double = a + (b - a) * u
