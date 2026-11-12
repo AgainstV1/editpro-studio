@@ -9,6 +9,8 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -65,6 +67,7 @@ import androidx.compose.ui.input.pointer.isMetaPressed
 import androidx.compose.ui.input.pointer.isPrimaryPressed
 import androidx.compose.ui.input.pointer.isShiftPressed
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
@@ -150,7 +153,7 @@ private const val MAX_ZOOM = 300.0
  * single clip up or down changes its track; drag an edge to trim. Drag across empty space with a
  * mouse, or long-press and drag with a finger, to select with a marquee. Right-click (or
  * long-press) a clip, a track header, a marker or empty space for its menu. Ctrl + mouse wheel
- * zooms around the pointer and Shift + wheel scrolls sideways.
+ * zooms around the pointer, Shift + wheel scrolls sideways, and a two-finger pinch zooms on touch.
  */
 @Composable
 fun TimelinePanel(
@@ -427,6 +430,31 @@ fun TimelinePanel(
                                         } else if (keys.isShiftPressed && delta.y != 0f) {
                                             scope.launch { hScroll.scrollBy(delta.y * 72f) }
                                             change.consume()
+                                        }
+                                    }
+                                }
+                            }
+                            // Touch: pinch with two fingers to zoom around the point between
+                            // them. Only acts while two fingers are down, so one-finger scrolls,
+                            // drags and taps are left alone.
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                    while (true) {
+                                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                                        val pressed = event.changes.count { it.pressed }
+                                        if (pressed == 0) break
+                                        if (pressed >= 2) {
+                                            val zoom = event.calculateZoom()
+                                            val pps = currentPxPerSec
+                                            if (zoom.isFinite() && zoom > 0f && zoom != 1f && pps > 0f) {
+                                                val centre = event.calculateCentroid(useCurrent = true)
+                                                if (centre != Offset.Unspecified) {
+                                                    zoomAnchor = (centre.x / pps).toDouble() to (centre.x - hScroll.value)
+                                                }
+                                                viewModel.setTimelineZoom(currentScale * zoom)
+                                            }
+                                            event.changes.forEach { if (it.positionChanged()) it.consume() }
                                         }
                                     }
                                 }

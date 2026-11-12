@@ -71,8 +71,9 @@ action can be rebound.
   applied. De-essing and reverb still are not; see `docs/MAINTENANCE.md`.
 - **Edge trims stop at the neighbouring clip**, at the start of the timeline and at the ends of
   the source, and snap to cuts, markers and the playhead.
-- **Timeline zoom** runs from a whole long edit down to a few frames, Ctrl + mouse wheel zooms
-  around the pointer, Shift + wheel scrolls sideways, and *Fit* really fits long edits.
+- **Timeline zoom** runs from a whole long edit down to a few frames. Ctrl + mouse wheel zooms
+  around the pointer, a two-finger pinch zooms on touch, Shift + wheel scrolls sideways, and
+  *Fit* really fits long edits.
 - **Undo covers the media library**, and a slider drag is one undo step.
 - **Save writes into the project.** Projects autosave, and are saved when the app leaves the
   foreground. Exporting and importing `.filmcraft` files moved to Tools and the front page.
