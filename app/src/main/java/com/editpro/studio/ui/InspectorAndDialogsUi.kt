@@ -2030,6 +2030,7 @@ fun ShortcutsDialog(
             modifier = Modifier
                 .widthIn(max = 560.dp)
                 .fillMaxWidth()
+                .heightIn(max = rememberDialogMaxHeight())
                 .clip(RoundedCornerShape(16.dp))
                 .background(palette.panel)
                 .border(0.5.dp, palette.line, RoundedCornerShape(16.dp))
@@ -2112,9 +2113,11 @@ fun ShortcutsDialog(
 
             Column(
                 verticalArrangement = Arrangement.spacedBy(4.dp),
+                // The list takes whatever height the sheet has left, so the sheet never grows
+                // past the window on a short screen.
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = minOf(420.dp, rememberDialogMaxHeight() - 200.dp))
+                    .weight(1f, fill = false)
                     .verticalScroll(rememberScrollState())
             ) {
                 val needle = query.trim()

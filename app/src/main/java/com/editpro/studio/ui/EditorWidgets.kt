@@ -347,3 +347,20 @@ fun Modifier.onSecondaryClick(key: Any?, onClick: (Offset) -> Unit): Modifier = 
         }
     }
 }
+
+/**
+ * Calls [onPress] whenever a pointer goes down anywhere inside this element, without taking the
+ * event. The workspace uses it to hand keyboard focus back to the editor when the timeline or the
+ * preview is touched, so shortcuts work again after typing in a text field.
+ */
+fun Modifier.onAnyPress(onPress: () -> Unit): Modifier = composed {
+    val current by rememberUpdatedState(onPress)
+    pointerInput(Unit) {
+        awaitPointerEventScope {
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                if (event.type == PointerEventType.Press) current()
+            }
+        }
+    }
+}

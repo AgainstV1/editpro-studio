@@ -18,6 +18,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
+import android.os.Build
 import android.media.MediaMuxer
 import com.editpro.studio.model.AssetKind
 import com.editpro.studio.model.ExportSettings
@@ -412,9 +413,21 @@ object NativeVideoExporter {
                         // The exact frame, not the nearest key frame: key frames are often a
                         // second apart, which turned exported motion into a slideshow. The key
                         // frame is only a fallback for the odd position a decoder cannot reach.
+                        // Ask for no more pixels than the frame can show (allowing for a clip
+                        // that is zoomed in): a 4K source decoded whole costs 33 MB per frame.
+                        val zoom = max(1.0, anim.scale / 100.0)
+                        val wantW = (width * zoom).roundToInt().coerceAtLeast(2)
+                        val wantH = (height * zoom).roundToInt().coerceAtLeast(2)
                         val vBmp = try {
-                            ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                                ?: ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            if (Build.VERSION.SDK_INT >= 27) {
+                                ret.getScaledFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST, wantW, wantH)
+                                    ?: ret.getScaledFrameAtTime(
+                                        targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, wantW, wantH
+                                    )
+                            } else {
+                                ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                    ?: ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            }
                         } catch (_: Exception) {
                             null
                         }

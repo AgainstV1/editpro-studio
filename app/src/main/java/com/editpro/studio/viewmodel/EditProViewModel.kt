@@ -991,7 +991,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             duration = max(0.1, asset.durationSec),
             track = track,
             clipId = id,
-            scalePxPerSec = s.timelineZoomPxPerSec,
+            scalePxPerSec = if (s.timelineAutoFit) visibleTimelineZoom else s.timelineZoomPxPerSec,
             direction = 1.0,
             allClips = s.clips,
             assetsById = s.assetsById,

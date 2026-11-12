@@ -130,6 +130,7 @@ import com.editpro.studio.ui.TextPromptDialog
 import com.editpro.studio.ui.TimelineDropGeometry
 import com.editpro.studio.ui.TimelinePanel
 import com.editpro.studio.ui.chordKeyName
+import com.editpro.studio.ui.onAnyPress
 import com.editpro.studio.ui.onSecondaryClick
 import com.editpro.studio.ui.parseHexColor
 import com.editpro.studio.ui.rememberIsCompact
@@ -366,6 +367,10 @@ fun EditProWorkspaceScreen(
         }
     }
 
+    // Touching the timeline or the preview hands the keyboard back to the editor, so shortcuts
+    // work again after typing in a text field without having to tab out of it first.
+    val reclaimFocus: () -> Unit = { runCatching { rootFocus.requestFocus() } }
+
     // Back leaves the editor for the project list instead of closing the app.
     BackHandler(enabled = !state.showHome) {
         if (state.previewMaximized) viewModel.toggleMaximizePreview() else viewModel.goHome()
@@ -495,7 +500,7 @@ fun EditProWorkspaceScreen(
                             onGradeSplitChange = viewModel::setGradeSplitPercent,
                             onStepFrames = viewModel::stepFrames,
                             onToggleMaximize = viewModel::toggleMaximizePreview,
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.weight(1f).onAnyPress(reclaimFocus)
                         )
                     }
 
@@ -583,7 +588,8 @@ fun EditProWorkspaceScreen(
                     pointerModifiers = pointerModifiers,
                     onRun = runShortcut,
                     onGeometry = { timelineGeometry = it },
-                    modifier = if (state.timelineCollapsed) Modifier else Modifier.height(state.timelineHeightDp.dp)
+                    modifier = (if (state.timelineCollapsed) Modifier else Modifier.height(state.timelineHeightDp.dp))
+                        .onAnyPress(reclaimFocus)
                 )
             }
         }
