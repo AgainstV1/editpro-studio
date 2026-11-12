@@ -258,18 +258,23 @@ fun TimelinePanel(
                 }
             }
 
-            fun timeAt(xPx: Float): Double = if (pxPerSec > 0f) max(0.0, (xPx / pxPerSec).toDouble()) else 0.0
-            fun rowAt(yPx: Float): TrackRow? {
-                val yDp = yPx / density.density
-                return rows.firstOrNull { yDp >= it.topDp && yDp < it.topDp + it.heightDp }
-            }
-
-            // Values the long-lived gesture blocks need at their current value.
+            // Gesture blocks are started once and outlive recompositions, so everything they use
+            // is read through these: a captured copy would be the zoom and layout of the moment
+            // the timeline first appeared.
             val currentState by rememberUpdatedState(state)
             val currentResolved by rememberUpdatedState(resolved)
             val currentRows by rememberUpdatedState(rows)
             val currentPxPerSec by rememberUpdatedState(pxPerSec)
             val currentScale by rememberUpdatedState(scale)
+
+            fun timeAt(xPx: Float): Double {
+                val pps = currentPxPerSec
+                return if (pps > 0f) max(0.0, (xPx / pps).toDouble()) else 0.0
+            }
+            fun rowAt(yPx: Float): TrackRow? {
+                val yDp = yPx / density.density
+                return currentRows.firstOrNull { yDp >= it.topDp && yDp < it.topDp + it.heightDp }
+            }
 
             var marquee by remember { mutableStateOf<Rect?>(null) }
             var marqueeBase by remember { mutableStateOf<Set<String>>(emptySet()) }

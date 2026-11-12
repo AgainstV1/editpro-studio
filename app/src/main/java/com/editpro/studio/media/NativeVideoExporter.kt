@@ -2,6 +2,7 @@ package com.editpro.studio.media
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapShader
 import android.graphics.Camera
 import android.graphics.Canvas
 import android.graphics.Color
@@ -379,6 +380,9 @@ object NativeVideoExporter {
                 }
             }
 
+            // Corner radius is in pixels of a 1280x720 frame, like every other size in a project.
+            val cornerPx = max(0f, c.cornerRadius * min(width / 1280f, height / 720f))
+
             when (asset.kind) {
                 AssetKind.COLOR -> {
                     layerPaint.color = try {
@@ -387,12 +391,14 @@ object NativeVideoExporter {
                         Color.parseColor("#2678ff")
                     }
                     layerPaint.alpha = (finalAlpha * 255).roundToInt().coerceIn(0, 255)
-                    canvas.drawRect(-width / 2f, -height / 2f, width / 2f, height / 2f, layerPaint)
+                    val frame = RectF(-width / 2f, -height / 2f, width / 2f, height / 2f)
+                    if (cornerPx > 0.5f) canvas.drawRoundRect(frame, cornerPx, cornerPx, layerPaint)
+                    else canvas.drawRect(frame, layerPaint)
                 }
                 AssetKind.IMAGE -> {
                     val bmp = bitmapCache[asset.id]
                     if (bmp != null) {
-                        drawContainedBitmap(canvas, bmp, width, height, layerPaint)
+                        drawContainedBitmap(canvas, bmp, width, height, layerPaint, cornerPx)
                     }
                 }
                 AssetKind.VIDEO -> {
@@ -400,7 +406,7 @@ object NativeVideoExporter {
                     val targetUs = max(0L, ((c.trimIn + localT * c.speed) * 1_000_000.0).toLong())
                     if (videoFrames != null) {
                         videoFrames.frameAt(c, asset, targetUs)?.let {
-                            drawContainedBitmap(canvas, it, width, height, layerPaint)
+                            drawContainedBitmap(canvas, it, width, height, layerPaint, cornerPx)
                         }
                     } else if (ret != null) {
                         // The exact frame, not the nearest key frame: key frames are often a
@@ -413,7 +419,7 @@ object NativeVideoExporter {
                             null
                         }
                         if (vBmp != null) {
-                            drawContainedBitmap(canvas, vBmp, width, height, layerPaint)
+                            drawContainedBitmap(canvas, vBmp, width, height, layerPaint, cornerPx)
                             vBmp.recycle()
                         }
                     }
@@ -442,14 +448,37 @@ object NativeVideoExporter {
         TitleRenderer.drawTitles(canvas, width, height, playheadSec, allResolved, trackStates)
     }
 
-    private fun drawContainedBitmap(canvas: Canvas, bmp: Bitmap, stageW: Int, stageH: Int, paint: Paint) {
+    /**
+     * Draws [bmp] fitted inside the frame and centred on the origin. With [cornerPx] the picture
+     * is drawn through a bitmap shader into a rounded rectangle, which keeps the corners
+     * anti-aliased where a clip path would leave them jagged.
+     */
+    private fun drawContainedBitmap(
+        canvas: Canvas,
+        bmp: Bitmap,
+        stageW: Int,
+        stageH: Int,
+        paint: Paint,
+        cornerPx: Float = 0f
+    ) {
         val bw = max(1, bmp.width)
         val bh = max(1, bmp.height)
         val ratio = min(stageW.toFloat() / bw, stageH.toFloat() / bh)
         val dw = bw * ratio
         val dh = bh * ratio
         val dst = RectF(-dw / 2f, -dh / 2f, dw / 2f, dh / 2f)
-        canvas.drawBitmap(bmp, null, dst, paint)
+        if (cornerPx <= 0.5f) {
+            canvas.drawBitmap(bmp, null, dst, paint)
+            return
+        }
+        val shader = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+        shader.setLocalMatrix(
+            Matrix().apply { setRectToRect(RectF(0f, 0f, bw.toFloat(), bh.toFloat()), dst, Matrix.ScaleToFit.FILL) }
+        )
+        val previous = paint.shader
+        paint.shader = shader
+        canvas.drawRoundRect(dst, cornerPx, cornerPx, paint)
+        paint.shader = previous
     }
 
     private fun argbToNv12(argb: IntArray, yuv: ByteArray, width: Int, height: Int) {

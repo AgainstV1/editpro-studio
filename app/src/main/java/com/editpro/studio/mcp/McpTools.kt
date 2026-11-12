@@ -2,7 +2,10 @@ package com.editpro.studio.mcp
 
 import android.app.Application
 import com.editpro.studio.media.WebAssetFetcher
+import com.editpro.studio.model.KeyframeOps
+import com.editpro.studio.model.KeyframePatch
 import com.editpro.studio.model.MediaAsset
+import com.editpro.studio.model.MotionGraphics
 import com.editpro.studio.model.PresetCatalog
 import com.editpro.studio.model.TimelineClip
 import com.editpro.studio.model.TimelineEngine
@@ -45,14 +48,23 @@ class McpTools(private val viewModel: EditProViewModel) {
                 JSONObject()
                     .put("name", "editpro-studio")
                     .put("title", "Edit Pro Studio")
-                    .put("version", "2.4.0")
+                    .put("version", appVersion())
             )
             .put(
                 "instructions",
                 "Edits an Edit Pro Studio video project on the user's tablet. Start with get_summary " +
-                    "and list_media, then build with add_clip / add_text and refine with update_clip. " +
+                    "and list_media, then build with add_clip / add_text / add_motion_graphic and refine " +
+                    "with update_clip, set_keyframe, edit_clips and move_clips. " +
                     "Every change is undoable, so prefer several small edits over one large one."
             )
+    }
+
+    /** The installed app's version, so the server never reports a stale hard-coded number. */
+    private fun appVersion(): String = try {
+        val app = viewModel.getApplication<Application>()
+        app.packageManager.getPackageInfo(app.packageName, 0).versionName ?: "unknown"
+    } catch (_: Exception) {
+        "unknown"
     }
 
     fun definitions(): JSONArray {
@@ -164,6 +176,7 @@ class McpTools(private val viewModel: EditProViewModel) {
                         .put("hidden", ts?.hidden ?: false)
                         .put("solo", ts?.solo ?: false)
                         .put("locked", ts?.locked ?: false)
+                        .put("collapsed", ts?.collapsed ?: false)
                 )
             }
             JSONObject()
@@ -174,6 +187,14 @@ class McpTools(private val viewModel: EditProViewModel) {
                 .put("clipCount", s.clips.size)
                 .put("assetCount", s.assets.size)
                 .put("selectedClipId", s.selectedClipId ?: JSONObject.NULL)
+                .put("selectedClipIds", JSONArray(s.selectionIds.toList()))
+                .put("projectId", s.currentProjectId ?: JSONObject.NULL)
+                .put("width", s.projectSettings.width)
+                .put("height", s.projectSettings.height)
+                .put("fps", s.projectSettings.fps)
+                .put("markers", JSONArray().also { arr ->
+                    s.markers.forEach { m -> arr.put(JSONObject().put("timeSec", m.time).put("label", m.label)) }
+                })
                 .put("workspaceMode", s.workspaceMode.id)
                 .put("canUndo", s.canUndo)
                 .put("canRedo", s.canRedo)
@@ -260,7 +281,7 @@ class McpTools(private val viewModel: EditProViewModel) {
                 "track. Returns the new clip id.",
             obj(
                 p("assetId", "string", "Asset id from list_media."),
-                p("track", "string", "video | video2 | overlay | text | audio | audio2. Defaults to the natural track."),
+p("track", "string", "video | video2 | overlay | audio | audio2. Defaults to the natural track."),
                 p("startSec", "number", "Absolute timeline position in seconds."),
                 p("trimIn", "number", "Seconds trimmed from the start of the source."),
                 p("trimOut", "number", "Seconds kept from the source start.")
@@ -280,7 +301,9 @@ class McpTools(private val viewModel: EditProViewModel) {
         ToolSpec(
             "update_clip",
             "Change any property of one clip: position, trim, track, transform, volume, text, fades and " +
-                "the full colour grade. Only the keys you pass are changed. Returns the updated clip.",
+                "the full colour grade. Only the keys you pass are changed. Returns the updated clip. " +
+                "On a clip that has keyframes, scale / opacity / rotation / x / y are driven by the " +
+                "keyframes, so change those with set_keyframe instead.",
             obj(
                 p("clipId", "string", "Target clip id."),
                 p("startSec", "number", "Absolute timeline position."),
@@ -298,6 +321,16 @@ class McpTools(private val viewModel: EditProViewModel) {
                 p("text", "string", "Text content, for text clips."),
                 p("fontSize", "integer", "Text size."),
                 p("textColor", "string", "Text colour as #rrggbb."),
+                p("accentColor", "string", "Motion graphics: plate / bar / shape colour as #rrggbb."),
+                p("textAlign", "string", "left | center | right."),
+                p("verticalPosition", "string", "top | center | bottom."),
+                p("boxW", "number", "Shape graphics: width, percent of frame."),
+                p("boxH", "number", "Shape graphics: height, percent of frame."),
+                p("introSec", "number", "Motion graphics: length of the intro and outro animation."),
+                p("speed", "number", "Playback speed, 0.25-4."),
+                p("pan", "number", "Audio pan, -100 (left) to 100 (right)."),
+                p("label", "string", "Clip name shown on the timeline."),
+                p("fadeOut", "number", "Picture fade-out seconds."),
                 p("fadeInAudio", "number", "Audio fade-in seconds."),
                 p("fadeOutAudio", "number", "Audio fade-out seconds."),
                 p("transition", "string", "Entrance transition id."),
@@ -361,9 +394,10 @@ class McpTools(private val viewModel: EditProViewModel) {
 
         ToolSpec(
             "set_track_state",
-            "Mute, hide, solo or lock a track. Only the flags you pass are changed.",
+"Mute, hide, solo, lock or collapse a track. Only the flags you pass are changed.",
             obj(
-                p("track", "string", "video | video2 | overlay | text | audio | audio2."),
+                p("track", "string", "video | video2 | overlay | graphics | text | audio | audio2."),
+                p("collapsed", "boolean", "Shrink the track to a thin strip in the timeline."),
                 p("muted", "boolean", "Silence the track."),
                 p("hidden", "boolean", "Exclude from the render."),
                 p("solo", "boolean", "Solo this audio track."),
@@ -376,7 +410,8 @@ class McpTools(private val viewModel: EditProViewModel) {
                 muted = if (args.has("muted")) args.optBoolean("muted") else null,
                 hidden = if (args.has("hidden")) args.optBoolean("hidden") else null,
                 solo = if (args.has("solo")) args.optBoolean("solo") else null,
-                locked = if (args.has("locked")) args.optBoolean("locked") else null
+                locked = if (args.has("locked")) args.optBoolean("locked") else null,
+                collapsed = if (args.has("collapsed")) args.optBoolean("collapsed") else null
             )
             if (!ok) throw IllegalArgumentException("Unknown track '$trackKey'.")
             JSONObject().put("track", trackKey)
@@ -392,18 +427,18 @@ class McpTools(private val viewModel: EditProViewModel) {
             ),
         ) { args ->
             val before = viewModel.uiState.value.clips.map { it.id }.toSet()
-            viewModel.addBlankTextClip()
+            viewModel.addBlankTextClip(if (args.has("startSec")) args.optDouble("startSec", 0.0) else null)
             val created = viewModel.uiState.value.clips.lastOrNull { it.id !in before }
-                ?: throw IllegalStateException("Could not create a text clip.")
+                ?: throw IllegalStateException("Could not create a text clip. The text track may be locked.")
             val text = args.optString("text", "Title")
             viewModel.mcpUpdateClip(created.id) { clip ->
                 clip.copy(
                     text = text,
-                    startAt = if (args.has("startSec")) args.optDouble("startSec", clip.startAt) else clip.startAt,
-                    trimOut = if (args.has("durationSec")) args.optDouble("durationSec", clip.trimOut) else clip.trimOut
+                    trimOut = if (args.has("durationSec")) args.optDouble("durationSec", clip.trimOut).coerceAtLeast(0.2) else clip.trimOut
                 )
             }
-            JSONObject().put("clipId", created.id)
+            val placed = viewModel.uiState.value.clips.first { it.id == created.id }
+            JSONObject().put("clipId", created.id).put("startSec", placed.startAt)
         },
 
         ToolSpec(
@@ -483,8 +518,210 @@ class McpTools(private val viewModel: EditProViewModel) {
                 throw IllegalArgumentException("No clip with id '$clipId'.")
             }
             JSONObject().put("clipId", clipId).put("timeSec", t)
+        },
+
+        ToolSpec(
+            "list_keyframes",
+            "The keyframes of one clip, in time order, with the values and easing each one holds.",
+            obj(p("clipId", "string", "Target clip.")),
+        ) { args ->
+            val clipId = args.optString("clipId", "")
+            val s = viewModel.uiState.value
+            val rc = s.resolvedClips.find { it.clip.id == clipId }
+                ?: throw IllegalArgumentException("No clip with id '$clipId'. Use list_clips.")
+            val out = JSONArray()
+            rc.clip.keyframes.sortedBy { it.time }.forEach { k ->
+                out.put(
+                    JSONObject()
+                        .put("timeSec", rc.start + k.time)
+                        .put("clipTimeSec", k.time)
+                        .put("scale", k.scale)
+                        .put("opacity", k.opacity)
+                        .put("rotation", k.rotation)
+                        .put("x", k.x)
+                        .put("y", k.y)
+                        .put("easing", k.easing.ifEmpty { "clip" })
+                )
+            }
+            out
+        },
+
+        ToolSpec(
+            "set_keyframe",
+            "Animate a clip: write a keyframe at a timeline time with the values you pass (the rest are " +
+                "taken from the clip's motion at that moment). Two keyframes with different values make a " +
+                "move, zoom, spin or fade between them. easing controls the move that starts at this keyframe.",
+            obj(
+                p("clipId", "string", "Target clip."),
+                p("timeSec", "number", "Absolute timeline time for the keyframe."),
+                p("scale", "number", "Percent of frame."),
+                p("opacity", "number", "0-100."),
+                p("rotation", "number", "Degrees."),
+                p("x", "number", "Horizontal offset, percent of frame."),
+                p("y", "number", "Vertical offset, percent of frame."),
+                p("easing", "string", "clip | linear | ease | in | out | hold.")
+            ),
+        ) { args ->
+            val clipId = args.optString("clipId", "")
+            if (!args.has("timeSec")) throw IllegalArgumentException("timeSec is required.")
+            val easing = if (args.has("easing")) {
+                val raw = args.optString("easing", "").lowercase()
+                val id = if (raw == "clip") "" else raw
+                if (KeyframeOps.EASINGS.none { it.first == id }) {
+                    throw IllegalArgumentException("Unknown easing '$raw'. Use clip, linear, ease, in, out or hold.")
+                }
+                id
+            } else null
+            fun num(key: String): Double? = if (args.has(key)) args.optDouble(key).takeIf { it.isFinite() } else null
+            val patch = KeyframePatch(
+                scale = num("scale"),
+                opacity = num("opacity")?.coerceIn(0.0, 100.0),
+                rotation = num("rotation"),
+                x = num("x"),
+                y = num("y"),
+                easing = easing
+            )
+            val t = args.optDouble("timeSec", 0.0)
+            if (!viewModel.mcpSetKeyframe(clipId, t, patch)) {
+                throw IllegalArgumentException("No clip with id '$clipId'. Use list_clips.")
+            }
+            val clip = viewModel.uiState.value.clips.first { it.id == clipId }
+            JSONObject().put("clipId", clipId).put("timeSec", t).put("keyframeCount", clip.keyframes.size)
+        },
+
+        ToolSpec(
+            "remove_keyframe",
+            "Delete the keyframe at a timeline time on one clip.",
+            obj(
+                p("clipId", "string", "Target clip."),
+                p("timeSec", "number", "Absolute timeline time of the keyframe.")
+            ),
+        ) { args ->
+            val clipId = args.optString("clipId", "")
+            val t = args.optDouble("timeSec", 0.0)
+            if (!viewModel.mcpRemoveKeyframe(clipId, t)) {
+                throw IllegalArgumentException("No keyframe at ${t}s on clip '$clipId'. Use list_keyframes.")
+            }
+            JSONObject().put("clipId", clipId).put("removedAtSec", t)
+        },
+
+        ToolSpec(
+            "list_motion_graphics",
+            "The motion-graphics templates: animated titles, lower thirds, counters, bars and shapes. " +
+                "Pass an id to add_motion_graphic.",
+            obj(),
+        ) {
+            val out = JSONArray()
+            MotionGraphics.templates.forEach { t ->
+                out.put(
+                    JSONObject()
+                        .put("id", t.id)
+                        .put("title", t.title)
+                        .put("category", t.category)
+                        .put("description", t.description)
+                        .put("defaultText", t.defaultText)
+                        .put("textHint", t.textHint)
+                        .put("defaultDurationSec", t.defaultDuration)
+                        .put("coversWholeEdit", t.fullLength)
+                )
+            }
+            out
+        },
+
+        ToolSpec(
+            "add_motion_graphic",
+            "Add a motion graphic as a clip. Text lines are separated by a newline; what each line means " +
+                "is in the template's textHint. Restyle it afterwards with update_clip (text, textColor, " +
+                "accentColor, fontSize, x, y, scale…). Returns the new clip id.",
+            obj(
+                p("templateId", "string", "Template id from list_motion_graphics."),
+                p("startSec", "number", "Absolute timeline position. Defaults to the playhead."),
+                p("durationSec", "number", "How long it stays on screen."),
+                p("text", "string", "Text content; use \\n between lines.")
+            ),
+        ) { args ->
+            val templateId = args.optString("templateId", "")
+            if (MotionGraphics.find(templateId) == null) {
+                throw IllegalArgumentException("Unknown template '$templateId'. Use list_motion_graphics.")
+            }
+            val id = viewModel.mcpAddGraphic(
+                templateId = templateId,
+                startSec = if (args.has("startSec")) args.optDouble("startSec", 0.0) else null,
+                durationSec = if (args.has("durationSec")) args.optDouble("durationSec", 4.0) else null,
+                text = if (args.has("text")) args.optString("text", "") else null
+            ) ?: throw IllegalStateException("Could not add the graphic. The graphics and text tracks may be locked.")
+            val s = viewModel.uiState.value
+            clipJson(s.clips.first { it.id == id }, s.assetsById)
+        },
+
+        ToolSpec(
+            "select_clips",
+            "Select clips in the editor so the user can see what you are about to change. An empty list " +
+                "clears the selection.",
+            obj("clipIds" to idArraySchema("Clip ids to select.")),
+        ) { args ->
+            val ids = idList(args)
+            if (ids.isEmpty()) viewModel.selectClip(null) else viewModel.selectClipsByIds(ids)
+            JSONObject().put("selectedClipIds", JSONArray(viewModel.uiState.value.selectionIds.toList()))
+        },
+
+        ToolSpec(
+            "move_clips",
+            "Slide several clips along the timeline together, keeping their spacing. The group stops at " +
+                "the first clip in its way rather than overlapping it. Returns how far it actually moved.",
+            obj(
+                "clipIds" to idArraySchema("Clips to move."),
+                p("deltaSec", "number", "Seconds to move; negative moves earlier.")
+            ),
+        ) { args ->
+            val ids = idList(args)
+            if (ids.isEmpty()) throw IllegalArgumentException("clipIds is required.")
+            val moved = viewModel.mcpMoveClips(ids, args.optDouble("deltaSec", 0.0))
+            JSONObject().put("movedSec", moved)
+        },
+
+        ToolSpec(
+            "edit_clips",
+            "Run a timeline edit on several clips at once. Operations: ripple_delete (remove and close " +
+                "the gap), duplicate, copy, cut, paste (at atSec, or the playhead), close_gaps (on the " +
+                "clips' tracks, or every track when clipIds is empty), detach_audio (video sound becomes " +
+                "its own audio clip), trim_start / trim_end (cut the clip at atSec and keep the other " +
+                "side), ripple_trim_start / ripple_trim_end (the same, closing the gap).",
+            obj(
+                "clipIds" to idArraySchema("Clips to act on. Not needed for paste or close_gaps."),
+                p("operation", "string", "One of the operations listed above."),
+                p("atSec", "number", "Timeline time for paste and the trim operations.")
+            ),
+        ) { args ->
+            val operation = args.optString("operation", "")
+            val before = viewModel.uiState.value.clips.map { it.id }.toSet()
+            val ok = viewModel.mcpEditClips(
+                clipIds = idList(args),
+                operation = operation,
+                atSec = if (args.has("atSec")) args.optDouble("atSec", 0.0) else null
+            )
+            if (!ok) {
+                throw IllegalArgumentException(
+                    "Could not run '$operation'. Check the operation name and that the clip ids exist (list_clips)."
+                )
+            }
+            val after = viewModel.uiState.value.clips.map { it.id }.toSet()
+            JSONObject()
+                .put("operation", operation)
+                .put("createdClipIds", JSONArray((after - before).toList()))
+                .put("removedClipIds", JSONArray((before - after).toList()))
         }
     )
+
+    private fun idArraySchema(description: String): JSONObject = JSONObject()
+        .put("type", "array")
+        .put("items", JSONObject().put("type", "string"))
+        .put("description", description)
+
+    private fun idList(args: JSONObject): Set<String> {
+        val array = args.optJSONArray("clipIds") ?: return emptySet()
+        return (0 until array.length()).mapNotNull { i -> array.optString(i, "").ifEmpty { null } }.toSet()
+    }
 
     // --------------------------------------------------------------- mapping
 
@@ -507,6 +744,23 @@ class McpTools(private val viewModel: EditProViewModel) {
         if (args.has("text")) out = out.copy(text = args.optString("text", out.text))
         if (args.has("fontSize")) out = out.copy(fontSize = args.optInt("fontSize", out.fontSize))
         if (args.has("textColor")) out = out.copy(textColor = args.optString("textColor", out.textColor))
+        if (args.has("accentColor")) out = out.copy(accentColor = args.optString("accentColor", out.accentColor))
+        if (args.has("textAlign")) {
+            args.optString("textAlign").takeIf { it in setOf("left", "center", "right") }?.let { out = out.copy(textAlign = it) }
+        }
+        if (args.has("verticalPosition")) {
+            args.optString("verticalPosition").takeIf { it in setOf("top", "center", "bottom") }
+                ?.let { out = out.copy(verticalPosition = it) }
+        }
+        if (args.has("boxW")) out = out.copy(boxW = args.optDouble("boxW", out.boxW).coerceIn(0.1, 100.0))
+        if (args.has("boxH")) out = out.copy(boxH = args.optDouble("boxH", out.boxH).coerceIn(0.1, 100.0))
+        if (args.has("introSec")) {
+            out = out.copy(transitionDuration = args.optDouble("introSec", out.transitionDuration).coerceIn(0.0, 5.0))
+        }
+        if (args.has("speed")) out = out.copy(speed = args.optDouble("speed", out.speed).coerceIn(0.25, 4.0))
+        if (args.has("pan")) out = out.copy(audioPan = args.optDouble("pan", out.audioPan).coerceIn(-100.0, 100.0))
+        if (args.has("label")) out = out.copy(label = args.optString("label", out.label))
+        if (args.has("fadeOut")) out = out.copy(fadeOut = args.optDouble("fadeOut", out.fadeOut).coerceAtLeast(0.0))
         if (args.has("fadeInAudio")) out = out.copy(fadeInAudio = args.optDouble("fadeInAudio", out.fadeInAudio))
         if (args.has("fadeOutAudio")) out = out.copy(fadeOutAudio = args.optDouble("fadeOutAudio", out.fadeOutAudio))
         if (args.has("transition")) out = out.copy(transition = args.optString("transition", out.transition))
@@ -566,6 +820,8 @@ class McpTools(private val viewModel: EditProViewModel) {
             .put("x", c.x)
             .put("y", c.y)
             .put("text", c.text)
+            .put("graphic", c.graphic.ifEmpty { JSONObject.NULL })
+            .put("speed", c.speed)
             .put("keyframeCount", c.keyframes.size)
     }
 

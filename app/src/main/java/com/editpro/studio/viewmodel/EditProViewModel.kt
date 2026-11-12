@@ -3334,7 +3334,8 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         muted: Boolean?,
         hidden: Boolean?,
         solo: Boolean?,
-        locked: Boolean?
+        locked: Boolean?,
+        collapsed: Boolean? = null
     ): Boolean {
         val track = TimelineTrack.entries.find { it.key == trackKey } ?: return false
         _uiState.update { st ->
@@ -3344,10 +3345,13 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                     muted = muted ?: current.muted,
                     hidden = hidden ?: current.hidden,
                     solo = solo ?: current.solo,
-                    locked = locked ?: current.locked
+                    locked = locked ?: current.locked,
+                    collapsed = collapsed ?: current.collapsed
                 ))
             )
         }
+        // Track states are part of the project file.
+        scheduleAutosave()
         return true
     }
 
