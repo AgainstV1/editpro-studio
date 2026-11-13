@@ -24,8 +24,26 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import com.editpro.studio.media.PreviewCompositor
+import com.editpro.studio.media.PreviewRequest
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -78,6 +96,8 @@ fun PreviewCenterPanel(
     onSelectScopeMode: (ScopesMode) -> Unit,
     onToggleGradeSplit: () -> Unit,
     onGradeSplitChange: (Float) -> Unit,
+    onStepFrames: (Int) -> Unit = {},
+    onToggleMaximize: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalEditProPalette.current
@@ -102,6 +122,8 @@ fun PreviewCenterPanel(
                 .padding(16.dp)
         ) {
             val stageAspect = state.projectSettings.width.toFloat() / max(1, state.projectSettings.height).toFloat()
+            val availW = constraints.maxWidth.coerceAtLeast(1)
+            val availH = constraints.maxHeight.coerceAtLeast(1)
 
             Box(
                 contentAlignment = Alignment.Center,
@@ -113,169 +135,46 @@ fun PreviewCenterPanel(
                     .border(1.dp, borderAccent, RoundedCornerShape(10.dp))
                     .clipToBounds()
             ) {
-                val activeResolved = state.resolvedClips.filter { rc ->
-                    val hidden = state.trackStates[rc.clip.track]?.hidden == true
-                    !hidden && state.playheadSec >= rc.start && state.playheadSec <= rc.end
+                // The picture itself comes from the export compositor, drawn off the main thread,
+                // so what is shown here is what the export will contain.
+                val stageWpx = if (availW / availH.toFloat() > stageAspect) availH * stageAspect else availW.toFloat()
+                val stageHpx = stageWpx / stageAspect
+                val shrink = min(1f, PREVIEW_MAX_EDGE / max(1f, max(stageWpx, stageHpx)))
+                val renderW = (((stageWpx * shrink).roundToInt() / 16) * 16).coerceAtLeast(32)
+                val renderH = (((stageHpx * shrink).roundToInt() / 16) * 16).coerceAtLeast(32)
+                val frame = rememberPreviewFrame(state, renderW, renderH)
+                if (frame != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = frame,
+                        contentDescription = "Preview",
+                        contentScale = ContentScale.FillBounds,
+                        modifier = Modifier.fillMaxSize()
+                    )
                 }
-                val visuals = activeResolved.filter { it.clip.track.isVisual && it.clip.assetId != null }
-                val texts = activeResolved.filter { it.clip.track == TimelineTrack.TEXT }
 
-                if (visuals.isEmpty() && texts.isEmpty()) {
+                val projectEnd = state.durationSec
+                val onScreen = state.resolvedClips.filter { rc ->
+                    state.trackStates[rc.clip.track]?.hidden != true &&
+                        (rc.clip.track.isVisual || rc.clip.track.isTitle) &&
+                        TimelineEngine.isActiveAt(rc, state.playheadSec, projectEnd)
+                }
+                if (onScreen.isEmpty()) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
-                            text = if (state.clips.isEmpty()) "Import media or tap Demo Reel, then add a clip to the timeline."
+                            text = if (state.clips.isEmpty()) "Import media, then add a clip to the timeline."
                             else "No clip at playhead.",
                             color = Color(0xFF626E82),
                             fontSize = 13.sp,
                             textAlign = TextAlign.Center
                         )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "EDIT PRO · NATIVE ANDROID STUDIO",
-                            color = Color(0xFF626E82),
-                            fontSize = 10.sp,
-                            letterSpacing = 1.sp
-                        )
                     }
                 } else {
-                    // Render Visual Layers (VIDEO 1, VIDEO 2, OVERLAY)
-                    for (rc in visuals) {
-                        val c = rc.clip
-                        val asset = c.assetId?.let { state.assetsById[it] } ?: continue
-                        val localT = state.playheadSec - rc.start
-                        val anim = TimelineEngine.animatedProps(c, localT)
-                        val f = anim.filters
-
-                        val transDur = max(0.05, c.transitionDuration)
-                        val transProgress = ((state.playheadSec - rc.start) / transDur).coerceIn(0.0, 1.0)
-                        val fadeInAlpha = if (c.transition == "fade" || c.transition == "dissolve") transProgress else 1.0
-                        val fadeOutAlpha = if (c.fadeOut > 0.0) ((rc.end - state.playheadSec) / c.fadeOut).coerceIn(0.0, 1.0) else 1.0
-                        val finalAlpha = ((anim.opacity / 100.0) * fadeInAlpha * fadeOutAlpha).toFloat().coerceIn(0f, 1f)
-                        val squeezeY = (1.0 - min(0.35, c.rig.anamorphic / 100.0)).toFloat()
-
-                        val androidColorMatrix = remember(f) { MediaEngine.buildColorMatrix(f) }
-                        val composeColorMatrix = remember(androidColorMatrix) { ColorMatrix(androidColorMatrix.array) }
-
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .graphicsLayer {
-                                    alpha = finalAlpha
-                                    val sc = (anim.scale / 100.0).toFloat()
-                                    scaleX = sc * (if (c.flipH) -1f else 1f)
-                                    scaleY = sc * squeezeY * (if (c.flipV) -1f else 1f)
-                                    rotationZ = anim.rotation.toFloat()
-                                    rotationX = c.rig.tiltX.toFloat()
-                                    rotationY = c.rig.swivelY.toFloat()
-                                    translationX = (anim.x / 100.0 * size.width).toFloat()
-                                    translationY = (anim.y / 100.0 * size.height).toFloat()
-                                    cameraDistance = 12f * density
-                                }
-                                .clip(RoundedCornerShape(c.cornerRadius.dp))
-                        ) {
-                            when (asset.kind) {
-                                AssetKind.COLOR -> {
-                                    val solidColor = try {
-                                        Color(android.graphics.Color.parseColor(asset.colorHex ?: "#2678ff"))
-                                    } catch (_: Exception) {
-                                        Color(0xFF2678FF)
-                                    }
-                                    Box(modifier = Modifier.fillMaxSize().background(solidColor))
-                                }
-                                AssetKind.IMAGE, AssetKind.VIDEO -> {
-                                    val bmp = remember(asset.localPath) {
-                                        asset.localPath?.let { path -> BitmapFactory.decodeFile(path)?.asImageBitmap() }
-                                    }
-                                    if (bmp != null) {
-                                        androidx.compose.foundation.Image(
-                                            bitmap = bmp,
-                                            contentDescription = c.label,
-                                            contentScale = ContentScale.Fit,
-                                            colorFilter = ColorFilter.colorMatrix(composeColorMatrix),
-                                            modifier = Modifier.fillMaxSize()
-                                        )
-                                    } else {
-                                        Box(
-                                            contentAlignment = Alignment.Center,
-                                            modifier = Modifier
-                                                .fillMaxSize()
-                                                .background(
-                                                    Brush.linearGradient(
-                                                        listOf(Color(0xFF102542), Color(0xFFF87060))
-                                                    )
-                                                )
-                                        ) {
-                                            Text(text = c.label, color = Color.White, fontWeight = FontWeight.Bold)
-                                        }
-                                    }
-                                }
-                                AssetKind.AUDIO -> Unit
-                            }
-                        }
-                    }
-
-                    // Vignette Layer
-                    val maxVignette = visuals.maxOfOrNull { it.clip.filters.vignette } ?: 0.0
-                    if (maxVignette > 0.0) {
-                        val vigAlpha = min(0.85, maxVignette / 100.0).toFloat()
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(
-                                    Brush.radialGradient(
-                                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = vigAlpha))
-                                    )
-                                )
-                        )
-                    }
-
-                    // Render Text & Titles Overlays
-                    for (rc in texts) {
-                        val c = rc.clip
-                        val localT = state.playheadSec - rc.start
-                        val anim = TimelineEngine.animatedProps(c, localT)
-                        val align = when (c.verticalPosition) {
-                            "top" -> Alignment.TopCenter
-                            "bottom" -> Alignment.BottomCenter
-                            else -> Alignment.Center
-                        }
-                        val txtColor = try {
-                            Color(android.graphics.Color.parseColor(c.textColor))
-                        } catch (_: Exception) {
-                            Color.White
-                        }
-                        Box(
-                            contentAlignment = align,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(horizontal = 24.dp, vertical = 20.dp)
-                                .graphicsLayer {
-                                    alpha = (anim.opacity / 100.0).toFloat().coerceIn(0f, 1f)
-                                    val sc = (anim.scale / 100.0).toFloat()
-                                    scaleX = sc
-                                    scaleY = sc
-                                    rotationZ = anim.rotation.toFloat()
-                                    translationX = (anim.x / 100.0 * size.width).toFloat()
-                                    translationY = (anim.y / 100.0 * size.height).toFloat()
-                                }
-                        ) {
-                            Text(
-                                text = c.text.ifEmpty { "Text" },
-                                color = txtColor,
-                                fontSize = (c.fontSize * 0.48f).coerceIn(12f, 64f).sp,
-                                fontWeight = if (c.fontWeight >= 700) FontWeight.ExtraBold else FontWeight.Medium,
-                                textAlign = when (c.textAlign) {
-                                    "left" -> TextAlign.Start
-                                    "right" -> TextAlign.End
-                                    else -> TextAlign.Center
-                                }
-                            )
-                        }
-                    }
-
-                    // Interactive Free-Framing Blue Transform Box for Selected Visual Clip
-                    val selClip = state.selectedClip
-                    if (selClip != null && selClip.track.isVisual && visuals.any { it.clip.id == selClip.id }) {
+                    // Blue box for moving and scaling the selected clip directly on the picture.
+                    // It follows keyframed motion, and a drag on an animated clip sets a keyframe.
+                    val selClip = state.inspectedClip
+                    if (selClip != null && onScreen.any { it.clip.id == selClip.id } &&
+                        state.trackStates[selClip.track]?.locked != true
+                    ) {
                         InteractivePreviewTransformBox(
                             clip = selClip,
                             onSnapHistory = onSnapHistory,
@@ -301,7 +200,7 @@ fun PreviewCenterPanel(
 
                 // Motion Mode Path & Rule-of-Thirds HUD
                 if (state.workspaceMode == WorkspaceMode.MOTION) {
-                    MotionHudCanvas(selectedClip = state.selectedClip)
+                    MotionHudCanvas(selectedClip = state.inspectedClip)
                 }
 
                 // Split-Screen Before/After Grade Wipe Line
@@ -312,20 +211,23 @@ fun PreviewCenterPanel(
                     )
                 }
 
-                // UI Zoom HUD pill in bottom-right of stage
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(10.dp)
-                        .background(Color(0xDD151519), RoundedCornerShape(7.dp))
-                        .border(0.5.dp, Color.White.copy(alpha = 0.14f), RoundedCornerShape(7.dp))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                ) {
-                    Text(
-                        text = "UI ${(state.uiZoom * 100).roundToInt()}%",
-                        color = Color(0xFFDDDDDD),
-                        fontSize = 10.sp
-                    )
+                // Shuttle speed badge while J / L playback is running faster or backwards.
+                if (state.isPlaying && state.shuttleRate != 1.0) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(10.dp)
+                            .background(Color(0xDD151519), RoundedCornerShape(7.dp))
+                            .border(0.5.dp, Color.White.copy(alpha = 0.14f), RoundedCornerShape(7.dp))
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = (if (state.shuttleRate < 0) "◀◀ " else "▶▶ ") + "${abs(state.shuttleRate).roundToInt()}×",
+                            color = Color(0xFFDDDDDD),
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
                 }
             }
 
@@ -333,7 +235,7 @@ fun PreviewCenterPanel(
             if (state.workspaceMode == WorkspaceMode.COLOR || state.scopesForceOn) {
                 LiveVideoScopesDock(
                     mode = state.scopesMode,
-                    filters = state.selectedClip?.filters ?: ClipFilters(),
+                    filters = state.inspectedClip?.filters ?: ClipFilters(),
                     playheadSec = state.playheadSec,
                     onSelectMode = onSelectScopeMode,
                     modifier = Modifier
@@ -364,11 +266,14 @@ fun PreviewCenterPanel(
                 .height(48.dp)
                 .background(palette.panel.copy(alpha = 0.85f))
                 .border(0.5.dp, palette.line)
+                .then(if (rememberIsCompact()) Modifier.horizontalScroll(rememberScrollState()) else Modifier)
                 .padding(horizontal = 12.dp)
         ) {
             TransportButton(label = "|◀", tooltip = "Go to start") { onSeek(0.0) }
             Spacer(modifier = Modifier.width(6.dp))
             TransportButton(label = "−1s", tooltip = "Back one second") { onSeek(state.playheadSec - 1.0) }
+            Spacer(modifier = Modifier.width(6.dp))
+            TransportButton(label = "‹", tooltip = "Back one frame") { onStepFrames(-1) }
             Spacer(modifier = Modifier.width(8.dp))
             Box(
                 contentAlignment = Alignment.Center,
@@ -386,6 +291,8 @@ fun PreviewCenterPanel(
                 )
             }
             Spacer(modifier = Modifier.width(8.dp))
+            TransportButton(label = "›", tooltip = "Forward one frame") { onStepFrames(1) }
+            Spacer(modifier = Modifier.width(6.dp))
             TransportButton(label = "+1s", tooltip = "Forward one second") { onSeek(state.playheadSec + 1.0) }
             Spacer(modifier = Modifier.width(6.dp))
             TransportButton(label = "▶|", tooltip = "Go to end") { onSeek(state.durationSec) }
@@ -412,9 +319,66 @@ fun PreviewCenterPanel(
                 isActive = state.gradeSplitOn,
                 onClick = onToggleGradeSplit
             )
+            Spacer(modifier = Modifier.width(6.dp))
+            TransportButton(
+                label = if (state.previewMaximized) "⤡" else "⤢",
+                tooltip = if (state.previewMaximized) "Restore panels" else "Maximise preview",
+                onClick = onToggleMaximize
+            )
         }
     }
 }
+
+/** Longest edge of a rendered preview frame; the stage scales it up beyond that. */
+private const val PREVIEW_MAX_EDGE = 960f
+
+/**
+ * The current preview frame, rendered by the export compositor on a background thread.
+ *
+ * Requests are conflated: while one frame is being drawn only the newest request is kept, so a
+ * fast scrub never queues up stale frames. During playback each frame is the precise one. While
+ * paused the nearest key frame appears at once and the precise frame follows as soon as the
+ * playhead rests.
+ */
+@Composable
+private fun rememberPreviewFrame(state: EditorUiState, widthPx: Int, heightPx: Int): ImageBitmap? {
+    val compositor = remember { PreviewCompositor() }
+    DisposableEffect(compositor) { onDispose { compositor.close() } }
+    var frame by remember { mutableStateOf<ImageBitmap?>(null) }
+    val request = rememberUpdatedState(
+        PreviewRequest(
+            width = widthPx,
+            height = heightPx,
+            playheadSec = state.playheadSec,
+            clips = state.clips,
+            assets = state.assets,
+            trackStates = state.trackStates,
+            checkerboard = state.checkerboardOn,
+            playing = state.isPlaying
+        )
+    )
+    LaunchedEffect(compositor) {
+        snapshotFlow { request.value }
+            .conflate()
+            .collect { req ->
+                val quick = withContext(compositor.dispatcher) { compositor.render(req, exact = req.playing) }
+                if (quick != null) frame = quick.asImageBitmap()
+                if (compositor.lastRenderApproximate) {
+                    val moved = withTimeoutOrNull(PREVIEW_SETTLE_MS) {
+                        snapshotFlow { request.value }.first { it != req }
+                    }
+                    if (moved == null) {
+                        val precise = withContext(compositor.dispatcher) { compositor.render(req, exact = true) }
+                        if (precise != null) frame = precise.asImageBitmap()
+                    }
+                }
+            }
+    }
+    return frame
+}
+
+/** How long the playhead must rest before the precise video frame replaces the key frame. */
+private const val PREVIEW_SETTLE_MS = 90L
 
 @Composable
 private fun TransportButton(label: String, tooltip: String, onClick: () -> Unit) {
@@ -425,6 +389,7 @@ private fun TransportButton(label: String, tooltip: String, onClick: () -> Unit)
             .size(34.dp)
             .clip(CircleShape)
             .background(palette.controlBg)
+            .semantics { contentDescription = tooltip }
             .clickable(onClick = onClick)
     ) {
         Text(text = label, color = palette.text, fontSize = 11.sp, fontWeight = FontWeight.Medium)

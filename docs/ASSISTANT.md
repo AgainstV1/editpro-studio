@@ -27,10 +27,13 @@ requirement is `POST {baseUrl}/chat/completions` with `tools` support.
 ## What it can do
 
 Exactly what the MCP tools can do, because it *is* the same tool layer: read the timeline, add and
-trim clips, move things between tracks, set the full colour grade, add titles and markers, apply
-looks, keyframe, undo and redo, and `fetch_url` a media file from the web into the library.
+trim clips, move things between tracks, set the full colour grade, add titles, motion graphics and
+markers, apply looks, animate with keyframes (values and easing), edit several clips at once
+(ripple delete, duplicate, paste, close gaps, detach audio), undo and redo, and `fetch_url` a
+media file from the web into the library.
 
-It cannot export, and it cannot clear the whole timeline.
+It cannot export, it cannot clear the whole timeline, and it does not create, open or delete
+projects — it works on the one that is open.
 
 ## How it stays sane
 

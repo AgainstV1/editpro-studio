@@ -22,23 +22,32 @@ import com.editpro.studio.model.AudioGearPreset
 import com.editpro.studio.model.CameraRig
 import com.editpro.studio.model.ClipFilters
 import com.editpro.studio.model.ClipMenuAction
+import com.editpro.studio.model.EditorShortcut
 import com.editpro.studio.model.EditorSnapshot
 import com.editpro.studio.model.EquipmentRigPreset
 import com.editpro.studio.model.ExportSettings
 import com.editpro.studio.model.InspectorTab
 import com.editpro.studio.model.Keyframe
+import com.editpro.studio.model.KeyframeOps
+import com.editpro.studio.model.KeyframePatch
 import com.editpro.studio.model.LookPreset
 import com.editpro.studio.model.MediaAsset
+import com.editpro.studio.model.MgTemplate
+import com.editpro.studio.model.MotionGraphics
 import com.editpro.studio.model.MotionKeyframeStep
 import com.editpro.studio.model.PresetCatalog
 import com.editpro.studio.model.ProjectSerializer
 import com.editpro.studio.model.ProjectSettings
+import com.editpro.studio.model.ProjectStore
+import com.editpro.studio.model.ProjectSummary
 import com.editpro.studio.model.RenderJob
 import com.editpro.studio.model.ResolvedClip
 import com.editpro.studio.model.ScopesMode
+import com.editpro.studio.model.ShortcutBindings
 import com.editpro.studio.model.TimelineClip
 import com.editpro.studio.model.TimelineEngine
 import com.editpro.studio.model.TimelineMarker
+import com.editpro.studio.model.TimelineOps
 import com.editpro.studio.model.TimelineTrack
 import com.editpro.studio.model.TrackState
 import com.editpro.studio.model.VolumePoint
@@ -66,20 +75,19 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-/** An action that would discard the current timeline and therefore asks first. */
-enum class PendingConfirm { NEW_PROJECT, OPEN_PROJECT, DEMO_REEL }
-
 /**
- * A record of a project the user saved through the system file picker. It is metadata only —
- * the app cannot reopen the file without the user picking it again, so this is not a live
- * index of the file system.
+ * A destructive action that asks before it runs. Held as data (never a lambda) so it survives
+ * recomposition cleanly. Starting, opening and duplicating projects no longer ask: every project
+ * is stored separately, so none of them can discard work.
  */
-data class RecentProject(
-    val name: String,
-    val savedAtEpochMs: Long,
-    val clipCount: Int,
-    val durationSec: Double
-)
+sealed interface PendingConfirm {
+    data class DeleteProject(val id: String, val name: String) : PendingConfirm
+    data class DeleteAssets(val ids: Set<String>, val clipCount: Int) : PendingConfirm
+    object ResetShortcuts : PendingConfirm
+}
+
+/** The three panels around the preview that can be collapsed out of the way. */
+enum class WorkspacePanel { LIBRARY, INSPECTOR, TIMELINE }
 
 /** One line in the in-app agent transcript. [role] is user, assistant, tool, toolResult or error. */
 data class AgentMessage(val role: String, val text: String)
@@ -129,7 +137,8 @@ data class EditorUiState(
     val customMotionPresets: Map<String, List<MotionKeyframeStep>> = emptyMap(),
     val customEquipmentRigs: Map<String, EquipmentRigPreset> = emptyMap(),
     val customAudioGear: Map<String, AudioGearPreset> = emptyMap(),
-    val shortcuts: Map<String, String> = defaultShortcuts,
+    /** The effective key map: defaults plus the user's own bindings. */
+    val bindings: ShortcutBindings = ShortcutBindings(),
     val exportSettings: ExportSettings = ExportSettings(),
     val renderQueue: List<RenderJob> = emptyList(),
     val isExporting: Boolean = false,
@@ -147,7 +156,25 @@ data class EditorUiState(
     val toastMessage: String? = null,
     val pendingConfirm: PendingConfirm? = null,
     val showHome: Boolean = true,
-    val recentProjects: List<RecentProject> = emptyList(),
+    /** Every project stored on this device, most recently changed first. */
+    val projects: List<ProjectSummary> = emptyList(),
+    /** The project open in the editor; null on a fresh install before anything is created. */
+    val currentProjectId: String? = null,
+    /** Library items picked for a bulk action (Ctrl / Shift click, or long-press on touch). */
+    val selectedAssetIds: Set<String> = emptySet(),
+    /** Clips held by Copy / Cut, with their original timing so Paste keeps their spacing. */
+    val clipClipboard: List<TimelineClip> = emptyList(),
+    /** Touch equivalent of holding Ctrl: every tap adds to or removes from the selection. */
+    val selectionMode: Boolean = false,
+    val showKeyframeLane: Boolean = false,
+    val libraryCollapsed: Boolean = false,
+    val inspectorCollapsed: Boolean = false,
+    val timelineCollapsed: Boolean = false,
+    val previewMaximized: Boolean = false,
+    val showGraphicsModal: Boolean = false,
+    val showNewProjectModal: Boolean = false,
+    /** Playback speed and direction for J / K / L shuttling: ±1, ±2, ±4 or ±8. */
+    val shuttleRate: Double = 1.0,
     /** Ordered ids of the clip context-menu entries the user has enabled. */
     val clipMenuOrder: List<String> = ClipMenuAction.defaultOrder,
     val showClipMenuModal: Boolean = false,
@@ -186,6 +213,35 @@ data class EditorUiState(
     val selectedAsset: MediaAsset?
         get() = assets.find { it.id == selectedAssetId }
 
+    /** Selected clips, falling back to the primary one when the set is empty. */
+    val selectionIds: Set<String>
+        get() = if (selectedClipIds.isNotEmpty()) selectedClipIds else setOfNotNull(selectedClipId)
+
+    val currentProject: ProjectSummary?
+        get() = projects.find { it.id == currentProjectId }
+
+    /** Clip-local time of the playhead inside the selected clip, or null when it is elsewhere. */
+    val selectedClipLocalTime: Double?
+        get() {
+            val id = selectedClipId ?: return null
+            val rc = resolvedClips.find { it.clip.id == id } ?: return null
+            return if (playheadSec < rc.start - 1e-6 || playheadSec > rc.end + 1e-6) null
+            else (playheadSec - rc.start).coerceIn(0.0, rc.duration)
+        }
+
+    /**
+     * The selected clip as the inspector should show it. Once a clip has keyframes the renderer
+     * reads the keyframes rather than the clip's base values, so the sliders show the animated
+     * values under the playhead — what is actually on screen.
+     */
+    val inspectedClip: TimelineClip?
+        get() {
+            val c = selectedClip ?: return null
+            if (c.keyframes.isEmpty()) return c
+            val rc = resolvedClips.find { it.clip.id == c.id } ?: return c
+            return shownAt(c, (playheadSec - rc.start).coerceIn(0.0, rc.duration))
+        }
+
     val allEquipmentRigs: Map<String, EquipmentRigPreset>
         get() = PresetCatalog.builtinEquipmentRigs + customEquipmentRigs
 
@@ -193,29 +249,13 @@ data class EditorUiState(
         get() = PresetCatalog.builtinAudioGear + customAudioGear
 
     companion object {
-        val defaultShortcuts: Map<String, String> = linkedMapOf(
-            "play" to "Space",
-            "split" to "s",
-            "delete" to "Delete",
-            "ripple" to "Shift+Delete",
-            "undo" to "Ctrl+z",
-            "redo" to "Ctrl+Shift+z",
-            "duplicate" to "Ctrl+d",
-            "marker" to "Ctrl+m",
-            "previous" to "ArrowLeft",
-            "next" to "ArrowRight",
-            "home" to "Home",
-            "end" to "End",
-            "autoFit" to "Ctrl+Alt+f",
-            "compact" to "Ctrl+Alt+c",
-            "snap" to "Ctrl+Alt+s",
-            "addVideo" to "v",
-            "addAudio" to "a",
-            "addImage" to "i",
-            "addText" to "t",
-            "follow" to "Ctrl+Alt+g",
-            "presets" to "Ctrl+Alt+p"
-        )
+        /** [clip] with its transform and grade replaced by their animated values at [localT]. */
+        fun shownAt(clip: TimelineClip, localT: Double): TimelineClip {
+            val a = TimelineEngine.animatedProps(clip, localT)
+            return clip.copy(
+                scale = a.scale, opacity = a.opacity, rotation = a.rotation, x = a.x, y = a.y, filters = a.filters
+            )
+        }
     }
 }
 
@@ -225,6 +265,8 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
     private val _uiState = MutableStateFlow(EditorUiState())
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
 
+    private val projectStore = ProjectStore(File(application.filesDir, "projects"))
+    private val saveLock = Any()
     private val history = ArrayDeque<EditorSnapshot>()
     private val future = ArrayDeque<EditorSnapshot>()
     private var playbackJob: Job? = null
@@ -237,11 +279,12 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         loadPersistedPreferences()
-        loadRecentProjects()
+        loadShortcutBindings()
         loadClipMenu()
         loadMcpToken()
         loadAgentSettings()
-        recoverAutosaveIfPresent()
+        migrateLegacyAutosave()
+        refreshProjects()
     }
 
     private fun loadPersistedPreferences() {
@@ -262,51 +305,157 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                 scrubFollow = scrub,
                 isLightTheme = light,
                 workspaceMode = mode,
-                activeInspectorTab = mode.defaultInspectorTab()
+                activeInspectorTab = mode.defaultInspectorTab(),
+                libraryCollapsed = prefs.getBoolean("panel_library_collapsed", false),
+                inspectorCollapsed = prefs.getBoolean("panel_inspector_collapsed", false),
+                timelineCollapsed = prefs.getBoolean("panel_timeline_collapsed", false),
+                showKeyframeLane = prefs.getBoolean("keyframe_lane", false)
             )
         }
     }
 
-    private fun recoverAutosaveIfPresent() {
+    // -------------------------------------------------------------------------
+    // PROJECT STORAGE
+    // Every project owns a folder (see ProjectStore): its edit, its imported media and its
+    // thumbnails. The editor always works on exactly one of them and saves into it.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Versions before 3.0 kept one autosaved edit in preferences and all media in a shared
+     * folder. That edit becomes the first stored project, with its media moved into the
+     * project's own folder, so nothing is lost by the upgrade.
+     */
+    private fun migrateLegacyAutosave() {
         val raw = prefs.getString("filmcraft_autosave", null) ?: return
         try {
             val doc = ProjectSerializer.deserializeProject(raw)
             if (doc.clips.isNotEmpty() || doc.assets.isNotEmpty()) {
-                val dur = TimelineEngine.calcProjectDuration(doc.clips, doc.assets.associateBy { it.id })
-                _uiState.update {
-                    it.copy(
-                        projectName = doc.name,
-                        projectSettings = doc.settings,
-                        assets = doc.assets,
-                        clips = doc.clips,
-                        markers = doc.markers,
-                        durationSec = dur,
-                        selectedClipId = doc.clips.firstOrNull()?.id,
-                        selectedClipIds = doc.clips.firstOrNull()?.let { c -> setOf(c.id) } ?: emptySet(),
-                        saveStatus = "Recovered autosaved project · ${doc.name}"
-                    )
-                }
+                val created = projectStore.create(doc.name, doc.settings)
+                val assets = doc.assets.map { projectStore.adoptAsset(created.id, it) }
+                val json = ProjectSerializer.serializeProject(created.name, doc.settings, doc.clips, doc.markers, assets)
+                projectStore.save(
+                    created.id, json, created.name, doc.clips.size, assets.size,
+                    TimelineEngine.calcProjectDuration(doc.clips, assets.associateBy { it.id }),
+                    doc.settings, thumbnailFor(assets, doc.clips)
+                )
             }
+            prefs.edit().remove("filmcraft_autosave").remove("recent_projects").apply()
         } catch (_: Exception) {
+            // An unreadable autosave is left in place rather than deleted; it is simply not migrated.
         }
     }
 
-    private fun scheduleAutosave() {
-        autosaveJob?.cancel()
-        autosaveJob = viewModelScope.launch(Dispatchers.IO) {
-            delay(900L)
-            val s = _uiState.value
-            try {
+    private fun refreshProjects() {
+        val list = runCatching { projectStore.list() }.getOrDefault(emptyList())
+        _uiState.update { it.copy(projects = list) }
+    }
+
+    private fun thumbnailFor(assets: List<MediaAsset>, clips: List<TimelineClip>): String? {
+        fun pathOf(a: MediaAsset): String? = when (a.kind) {
+            AssetKind.IMAGE -> a.localPath
+            AssetKind.VIDEO -> a.filmstripPaths.firstOrNull()
+            else -> null
+        }
+        val byId = assets.associateBy { it.id }
+        // Prefer what the edit opens on; fall back to anything in the library.
+        return clips.filter { it.track.isVisual }
+            .sortedWith(compareBy({ it.startAt }, { it.track.ordinal }))
+            .firstNotNullOfOrNull { c -> c.assetId?.let { byId[it] }?.let { pathOf(it) } }
+            ?: assets.firstNotNullOfOrNull { pathOf(it) }
+    }
+
+    /**
+     * The project the editor saves into. Normally one is already open; if edits arrive with none
+     * (the assistant adding media from the home screen, say) a project is created for them.
+     */
+    private fun ensureProjectId(force: Boolean = false): String? {
+        val s = _uiState.value
+        s.currentProjectId?.let { return it }
+        if (!force && s.clips.isEmpty() && s.assets.isEmpty()) return null
+        val created = runCatching { projectStore.create(s.projectName, s.projectSettings) }.getOrNull() ?: return null
+        _uiState.update { it.copy(currentProjectId = created.id, projectName = created.name) }
+        prefs.edit().putString("last_project_id", created.id).apply()
+        return created.id
+    }
+
+    /** The part of the editor state that is written to the project file. */
+    private data class SavedContent(
+        val projectId: String?,
+        val name: String,
+        val settings: ProjectSettings,
+        val clips: List<TimelineClip>,
+        val markers: List<TimelineMarker>,
+        val assets: List<MediaAsset>,
+        val trackStates: Map<TimelineTrack, TrackState>
+    )
+
+    private fun contentOf(s: EditorUiState) = SavedContent(
+        s.currentProjectId, s.projectName, s.projectSettings, s.clips, s.markers, s.assets, s.trackStates
+    )
+
+    /**
+     * What the project file on disk holds. A save is skipped when the editor still matches it, so
+     * merely opening and closing a project neither rewrites it nor moves it up the project list.
+     */
+    @Volatile
+    private var savedContent: SavedContent? = null
+
+    private fun writeProject(id: String, s: EditorUiState) {
+        synchronized(saveLock) {
+            runCatching {
                 val json = ProjectSerializer.serializeProject(
                     name = s.projectName,
                     settings = s.projectSettings,
                     clips = s.clips,
                     markers = s.markers,
-                    assets = s.assets
+                    assets = s.assets,
+                    trackStates = s.trackStates
                 )
-                prefs.edit().putString("filmcraft_autosave", json).apply()
-            } catch (_: Exception) {
+                projectStore.save(
+                    id, json, s.projectName, s.clips.size, s.assets.size, s.durationSec,
+                    s.projectSettings, thumbnailFor(s.assets, s.clips)
+                )
+                savedContent = contentOf(s).copy(projectId = id)
             }
+        }
+    }
+
+    private fun scheduleAutosave() {
+        autosaveJob?.cancel()
+        autosaveJob = viewModelScope.launch {
+            delay(900L)
+            val id = ensureProjectId() ?: return@launch
+            // State and id are read together, so a save can never land in a different project.
+            val snapshot = _uiState.value
+            if (snapshot.currentProjectId != id) return@launch
+            if (contentOf(snapshot) == savedContent) return@launch
+            withContext(Dispatchers.IO) { writeProject(id, snapshot) }
+            _uiState.update { if (it.currentProjectId == id) it.copy(saveStatus = "All changes saved") else it }
+        }
+    }
+
+    /** Writes any pending changes immediately — before leaving a project, and for Ctrl+S. */
+    private fun flushSave(): Boolean {
+        autosaveJob?.cancel()
+        autosaveJob = null
+        val id = ensureProjectId() ?: return false
+        val current = _uiState.value
+        if (contentOf(current) != savedContent) writeProject(id, current)
+        return true
+    }
+
+    /** Writes pending changes without a message — called when the app leaves the foreground. */
+    fun saveProjectQuietly() {
+        if (flushSave()) _uiState.update { it.copy(saveStatus = "All changes saved") }
+    }
+
+    fun saveProjectNow() {
+        if (flushSave()) {
+            _uiState.update { it.copy(saveStatus = "All changes saved") }
+            refreshProjects()
+            showToast("Project saved")
+        } else {
+            showToast("Nothing to save yet")
         }
     }
 
@@ -329,19 +478,23 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
     // -------------------------------------------------------------------------
     // UNDO / REDO SNAPSHOT ENGINE (60 STEPS)
     // -------------------------------------------------------------------------
-    fun snapHistory() {
+    private fun currentSnapshot(): EditorSnapshot {
         val s = _uiState.value
-        history.addLast(
-            EditorSnapshot(
-                clips = s.clips,
-                markers = s.markers,
-                playhead = s.playheadSec,
-                selectedClipId = s.selectedClipId,
-                projectName = s.projectName,
-                duration = s.durationSec,
-                settings = s.projectSettings
-            )
+        return EditorSnapshot(
+            clips = s.clips,
+            markers = s.markers,
+            playhead = s.playheadSec,
+            selectedClipId = s.selectedClipId,
+            projectName = s.projectName,
+            duration = s.durationSec,
+            settings = s.projectSettings,
+            assets = s.assets,
+            selectedClipIds = s.selectedClipIds
         )
+    }
+
+    fun snapHistory() {
+        history.addLast(currentSnapshot())
         if (history.size > 60) history.removeFirst()
         future.clear()
         _uiState.update { it.copy(canUndo = history.isNotEmpty(), canRedo = false) }
@@ -349,18 +502,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
 
     fun undo() {
         if (history.isEmpty()) return
-        val cur = _uiState.value
-        future.addLast(
-            EditorSnapshot(
-                clips = cur.clips,
-                markers = cur.markers,
-                playhead = cur.playheadSec,
-                selectedClipId = cur.selectedClipId,
-                projectName = cur.projectName,
-                duration = cur.durationSec,
-                settings = cur.projectSettings
-            )
-        )
+        future.addLast(currentSnapshot())
         val prev = history.removeLast()
         restoreSnapshot(prev)
         showToast("Undo")
@@ -368,33 +510,31 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
 
     fun redo() {
         if (future.isEmpty()) return
-        val cur = _uiState.value
-        history.addLast(
-            EditorSnapshot(
-                clips = cur.clips,
-                markers = cur.markers,
-                playhead = cur.playheadSec,
-                selectedClipId = cur.selectedClipId,
-                projectName = cur.projectName,
-                duration = cur.durationSec,
-                settings = cur.projectSettings
-            )
-        )
+        history.addLast(currentSnapshot())
         val next = future.removeLast()
         restoreSnapshot(next)
         showToast("Redo")
     }
 
     private fun restoreSnapshot(snap: EditorSnapshot) {
-        val assetsById = _uiState.value.assetsById
-        val dur = TimelineEngine.calcProjectDuration(snap.clips, assetsById)
-        _uiState.update {
-            it.copy(
+        _uiState.update { cur ->
+            // The library is part of the snapshot, so undoing an import or a removal restores
+            // the clips *and* their media. Favourite / bin changes are not edits and are kept.
+            val live = cur.assets.associateBy { it.id }
+            val assets = snap.assets.map { a -> live[a.id]?.let { a.copy(favorite = it.favorite, bin = it.bin) } ?: a }
+            val dur = TimelineEngine.calcProjectDuration(snap.clips, assets.associateBy { it.id })
+            val ids = snap.clips.map { it.id }.toSet()
+            val selected = snap.selectedClipIds.filter { it in ids }.toSet()
+            val primary = snap.selectedClipId?.takeIf { it in ids }
+            cur.copy(
                 clips = snap.clips,
                 markers = snap.markers,
+                assets = assets,
+                selectedAssetId = cur.selectedAssetId?.takeIf { id -> assets.any { it.id == id } },
+                selectedAssetIds = cur.selectedAssetIds.filter { id -> assets.any { it.id == id } }.toSet(),
                 playheadSec = min(snap.playhead, dur),
-                selectedClipId = snap.selectedClipId,
-                selectedClipIds = snap.selectedClipId?.let { id -> setOf(id) } ?: emptySet(),
+                selectedClipId = primary,
+                selectedClipIds = if (selected.isNotEmpty()) selected else setOfNotNull(primary),
                 projectName = snap.projectName,
                 durationSec = dur,
                 projectSettings = snap.settings,
@@ -517,9 +657,24 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update {
             it.copy(
                 timelineAutoFit = false,
-                timelineZoomPxPerSec = pxPerSec.coerceIn(5.0, 180.0)
+                timelineZoomPxPerSec = pxPerSec.coerceIn(1.0, 300.0)
             )
         }
+    }
+
+    /**
+     * The zoom the timeline is actually drawn at. While Fit is on that is not the stored zoom,
+     * and zooming in or out should carry on from what is on screen rather than jump.
+     */
+    private var visibleTimelineZoom = 75.0
+
+    fun noteVisibleTimelineZoom(pxPerSec: Double) {
+        if (pxPerSec.isFinite() && pxPerSec > 0.0) visibleTimelineZoom = pxPerSec
+    }
+
+    fun zoomTimelineBy(factor: Double) {
+        val s = _uiState.value
+        setTimelineZoom((if (s.timelineAutoFit) visibleTimelineZoom else s.timelineZoomPxPerSec) * factor)
     }
 
     fun zoomToSelectedClip(viewportWidthPx: Float) {
@@ -585,11 +740,24 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             }
 
             if (added.isNotEmpty()) {
+                // Imported media belongs to the open project: it moves into the project's folder.
+                val projectId = ensureProjectId(force = true)
+                val owned = if (projectId == null) added else withContext(Dispatchers.IO) {
+                    added.map { projectStore.adoptAsset(projectId, it) }
+                }
+                if (_uiState.value.currentProjectId != projectId) {
+                    // The project was closed while the files were being copied.
+                    withContext(Dispatchers.IO) { owned.forEach { a -> a.localPath?.let { runCatching { File(it).delete() } } } }
+                    showToast("Import cancelled: the project was closed.")
+                    return@launch
+                }
+                snapHistory()
                 _uiState.update { s ->
                     s.copy(
-                        assets = s.assets + added,
-                        selectedAssetId = added.first().id,
-                        saveStatus = "${added.size} media file(s) imported"
+                        assets = s.assets + owned,
+                        selectedAssetId = owned.first().id,
+                        selectedAssetIds = owned.map { it.id }.toSet(),
+                        saveStatus = "${owned.size} media file(s) imported"
                     )
                 }
                 scheduleAutosave()
@@ -622,8 +790,137 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun selectAsset(assetId: String) {
-        _uiState.update { it.copy(selectedAssetId = assetId) }
+    /**
+     * Selects a library item. [additive] (Ctrl-click, or a tap in multi-select mode) toggles it
+     * in the selection; [range] (Shift-click) selects everything between the last pick and it,
+     * in the order of [visibleOrder] — the library as currently filtered.
+     */
+    fun selectAsset(
+        assetId: String,
+        additive: Boolean = false,
+        range: Boolean = false,
+        visibleOrder: List<String> = emptyList()
+    ) {
+        _uiState.update { s ->
+            when {
+                range && s.selectedAssetId != null && visibleOrder.isNotEmpty() -> {
+                    val a = visibleOrder.indexOf(s.selectedAssetId)
+                    val b = visibleOrder.indexOf(assetId)
+                    if (a < 0 || b < 0) s.copy(selectedAssetId = assetId, selectedAssetIds = setOf(assetId))
+                    else s.copy(selectedAssetIds = visibleOrder.subList(min(a, b), max(a, b) + 1).toSet())
+                }
+                additive -> {
+                    val base = if (s.selectedAssetIds.isEmpty()) setOfNotNull(s.selectedAssetId) else s.selectedAssetIds
+                    val next = if (assetId in base) base - assetId else base + assetId
+                    s.copy(selectedAssetIds = next, selectedAssetId = if (assetId in next) assetId else next.lastOrNull())
+                }
+                else -> s.copy(selectedAssetId = assetId, selectedAssetIds = setOf(assetId))
+            }
+        }
+    }
+
+    fun selectAllAssets(visibleOrder: List<String>) {
+        _uiState.update { it.copy(selectedAssetIds = visibleOrder.toSet(), selectedAssetId = it.selectedAssetId ?: visibleOrder.firstOrNull()) }
+    }
+
+    fun clearAssetSelection() {
+        _uiState.update { it.copy(selectedAssetIds = emptySet()) }
+    }
+
+    /** Library items a bulk action applies to: the multi-selection, or the single selected item. */
+    private fun targetAssetIds(s: EditorUiState, clickedId: String? = null): Set<String> = when {
+        clickedId != null && clickedId !in s.selectedAssetIds -> setOf(clickedId)
+        s.selectedAssetIds.isNotEmpty() -> s.selectedAssetIds
+        else -> setOfNotNull(clickedId ?: s.selectedAssetId)
+    }
+
+    /** Appends the chosen library items to the timeline one after another, each on its natural track. */
+    fun addAssetsToTimeline(clickedId: String? = null) {
+        val s = _uiState.value
+        val ids = targetAssetIds(s, clickedId)
+        val chosen = s.assets.filter { it.id in ids }
+        if (chosen.isEmpty()) {
+            showToast("Select media in the library first")
+            return
+        }
+        if (chosen.size == 1) {
+            addAssetToTimeline(chosen.first())
+            return
+        }
+        snapHistory()
+        var clips = s.clips
+        val created = ArrayList<String>()
+        for (asset in chosen) {
+            val track = TimelineOps.naturalTrack(asset)
+            if (s.trackStates[track]?.locked == true) continue
+            val end = TimelineEngine.starts(clips, s.assetsById).filter { it.clip.track == track }.maxOfOrNull { it.end } ?: 0.0
+            val clip = TimelineClip(
+                id = generateUid(), assetId = asset.id, track = track, startAt = end,
+                trimIn = 0.0, trimOut = asset.durationSec, label = asset.name
+            )
+            clips = clips + clip
+            created.add(clip.id)
+        }
+        if (created.isEmpty()) {
+            showToast("The target tracks are locked.")
+            return
+        }
+        _uiState.update { it.copy(clips = clips, selectedClipId = created.last(), selectedClipIds = created.toSet()) }
+        recalcAndSync("${created.size} clips added to timeline")
+        showToast("Added ${created.size} clips to the timeline")
+    }
+
+    /** Asks before removing library items, because their clips go with them. */
+    fun requestDeleteAssets(clickedId: String? = null) {
+        val s = _uiState.value
+        val ids = targetAssetIds(s, clickedId)
+        if (ids.isEmpty()) {
+            showToast("Select media in the library first")
+            return
+        }
+        val used = s.clips.count { it.assetId in ids }
+        _uiState.update { it.copy(pendingConfirm = PendingConfirm.DeleteAssets(ids, used)) }
+    }
+
+    /**
+     * Removes media from the library together with the clips that use it. Undoable: the files
+     * stay on disk until the project is closed, so undo brings everything back.
+     */
+    fun deleteAssets(ids: Set<String>) {
+        val s = _uiState.value
+        val present = s.assets.filter { it.id in ids }
+        if (present.isEmpty()) return
+        snapHistory()
+        _uiState.update { st ->
+            val clips = st.clips.filterNot { it.assetId in ids }
+            val kept = clips.map { it.id }.toSet()
+            st.copy(
+                assets = st.assets.filterNot { it.id in ids },
+                clips = clips,
+                selectedAssetId = st.selectedAssetId?.takeIf { it !in ids },
+                selectedAssetIds = st.selectedAssetIds - ids,
+                selectedClipId = st.selectedClipId?.takeIf { it in kept },
+                selectedClipIds = st.selectedClipIds.filter { it in kept }.toSet()
+            )
+        }
+        recalcAndSync("Media removed from project")
+        showToast(if (present.size == 1) "Removed ${present.first().name}" else "Removed ${present.size} media files")
+    }
+
+    /** Selects every library item no clip uses, ready to be removed in one go. */
+    fun selectUnusedAssets() {
+        val s = _uiState.value
+        val used = s.clips.mapNotNull { it.assetId }.toSet()
+        val unused = s.assets.filter { it.id !in used }.map { it.id }.toSet()
+        _uiState.update { it.copy(selectedAssetIds = unused, selectedAssetId = unused.firstOrNull() ?: it.selectedAssetId) }
+        showToast(if (unused.isEmpty()) "Every media file is used on the timeline" else "${unused.size} unused media file(s) selected")
+    }
+
+    fun renameAsset(assetId: String, name: String) {
+        val clean = name.trim()
+        if (clean.isEmpty()) return
+        _uiState.update { s -> s.copy(assets = s.assets.map { if (it.id == assetId) it.copy(name = clean) else it }) }
+        scheduleAutosave()
     }
 
     fun toggleAssetFavorite(assetId: String) {
@@ -679,13 +976,31 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
     // TIMELINE CLIP & TRACK EDITING OPERATIONS
     // -------------------------------------------------------------------------
     fun addAssetToTimeline(asset: MediaAsset, targetTrack: TimelineTrack? = null, startAtOverride: Double? = null) {
-        snapHistory()
         val s = _uiState.value
-        val track = targetTrack ?: if (asset.kind == AssetKind.AUDIO) TimelineTrack.AUDIO else TimelineTrack.VIDEO
+        // A drop on a track that cannot hold this kind of media goes to its natural track instead.
+        val track = TimelineOps.dropTrack(asset, targetTrack)
+        if (s.trackStates[track]?.locked == true) {
+            showToast("${track.label} is locked. Unlock it before adding clips.")
+            return
+        }
+        snapHistory()
         val trackEnd = s.resolvedClips.filter { it.clip.track == track }.maxOfOrNull { it.end } ?: 0.0
-        val clipStart = startAtOverride ?: trackEnd
+        val id = generateUid()
+        val clipStart = TimelineEngine.resolveTimelineStart(
+            desired = startAtOverride ?: trackEnd,
+            duration = max(0.1, asset.durationSec),
+            track = track,
+            clipId = id,
+            scalePxPerSec = if (s.timelineAutoFit) visibleTimelineZoom else s.timelineZoomPxPerSec,
+            direction = 1.0,
+            allClips = s.clips,
+            assetsById = s.assetsById,
+            playhead = s.playheadSec,
+            magneticSnap = s.magneticSnap && startAtOverride != null,
+            extraSnapTimes = if (startAtOverride != null) TimelineOps.snapTimes(s.resolvedClips, emptySet(), s.markers) else emptyList()
+        )
         val newClip = TimelineClip(
-            id = generateUid(),
+            id = id,
             assetId = asset.id,
             track = track,
             startAt = clipStart,
@@ -743,14 +1058,23 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         showToast("Added $cleanName · ${cleanDur}s solid colour clip")
     }
 
-    fun addBlankTextClip() {
-        snapHistory()
+    fun addBlankTextClip(atSec: Double? = null) {
         val s = _uiState.value
+        if (s.trackStates[TimelineTrack.TEXT]?.locked == true) {
+            showToast("${TimelineTrack.TEXT.label} is locked.")
+            return
+        }
+        snapHistory()
+        val id = generateUid()
         val clip = TimelineClip(
-            id = generateUid(),
+            id = id,
             assetId = null,
             track = TimelineTrack.TEXT,
-            startAt = s.playheadSec,
+            startAt = TimelineEngine.resolveTimelineStart(
+                desired = atSec ?: s.playheadSec, duration = 5.0, track = TimelineTrack.TEXT, clipId = id,
+                scalePxPerSec = 0.0, direction = 1.0, allClips = s.clips, assetsById = s.assetsById,
+                playhead = s.playheadSec, magneticSnap = false
+            ),
             trimIn = 0.0,
             trimOut = 5.0,
             text = "Edit this title",
@@ -773,7 +1097,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             )
         }
         recalcAndSync("Text overlay added")
-        showToast("Text overlay added at ${formatTimecode(s.playheadSec)}")
+        showToast("Text overlay added at ${formatTimecode(clip.startAt)}")
     }
 
     fun importSrtContent(srtText: String) {
@@ -794,43 +1118,122 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         showToast("Imported ${cues.size} subtitle cues.")
     }
 
-    fun selectClip(clipId: String?, additiveShift: Boolean = false) {
+    /**
+     * Selects a clip. [additive] (Ctrl-click, or any tap while multi-select mode is on) toggles
+     * the clip in the selection; [range] (Shift-click) selects everything between the primary
+     * clip and this one, across the tracks between them.
+     */
+    fun selectClip(clipId: String?, additive: Boolean = false, range: Boolean = false) {
         if (clipId == null) {
             _uiState.update { it.copy(selectedClipId = null, selectedClipIds = emptySet()) }
             return
         }
         _uiState.update { s ->
-            val nextSet = if (additiveShift) {
-                val mutable = s.selectedClipIds.toMutableSet()
-                if (clipId in mutable) mutable.remove(clipId) else mutable.add(clipId)
-                mutable
-            } else {
-                setOf(clipId)
+            when {
+                range && s.selectedClipId != null && s.selectedClipId != clipId -> {
+                    val ids = TimelineOps.rangeBetween(s.resolvedClips, s.selectedClipId, clipId)
+                    s.copy(selectedClipIds = if (additive) s.selectedClipIds + ids else ids)
+                }
+                additive || s.selectionMode -> {
+                    val base = s.selectionIds
+                    val next = if (clipId in base) base - clipId else base + clipId
+                    s.copy(selectedClipId = if (clipId in next) clipId else next.lastOrNull(), selectedClipIds = next)
+                }
+                else -> s.copy(selectedClipId = clipId, selectedClipIds = setOf(clipId))
             }
-            val primary = if (clipId in nextSet) clipId else nextSet.firstOrNull()
-            s.copy(selectedClipId = primary, selectedClipIds = nextSet)
         }
     }
 
-    fun selectClipsByIds(ids: Set<String>) {
+    /** Replaces (or, with [additive], extends) the selection — used by the marquee and by tools. */
+    fun selectClipsByIds(ids: Set<String>, additive: Boolean = false) {
         _uiState.update { s ->
+            val existing = s.clips.map { it.id }.toSet()
+            val next = (if (additive) s.selectionIds + ids else ids).filter { it in existing }.toSet()
             s.copy(
-                selectedClipIds = ids,
-                selectedClipId = ids.lastOrNull()
+                selectedClipIds = next,
+                selectedClipId = s.selectedClipId?.takeIf { it in next } ?: next.lastOrNull()
             )
         }
     }
 
+    /** Selects what a marquee dragged across [tracks] between two times touches. */
+    fun selectClipsInRange(tracks: Set<TimelineTrack>, fromSec: Double, toSec: Double, additive: Boolean = false) {
+        val s = _uiState.value
+        selectClipsByIds(TimelineOps.clipsInRange(s.resolvedClips, tracks, fromSec, toSec), additive)
+    }
+
+    fun selectAllClips(track: TimelineTrack? = null) {
+        val s = _uiState.value
+        val ids = s.clips.filter { track == null || it.track == track }.map { it.id }.toSet()
+        if (ids.isEmpty()) {
+            showToast("Nothing to select.")
+            return
+        }
+        selectClipsByIds(ids)
+        showToast("${ids.size} clip(s) selected")
+    }
+
+    fun selectClipsFromPlayhead() {
+        val s = _uiState.value
+        val ids = TimelineOps.clipsFrom(s.resolvedClips, s.playheadSec - 1e-6)
+        if (ids.isEmpty()) {
+            showToast("No clips after the playhead.")
+            return
+        }
+        selectClipsByIds(ids)
+        showToast("${ids.size} clip(s) selected")
+    }
+
+    fun toggleSelectionMode() {
+        val next = !_uiState.value.selectionMode
+        _uiState.update { it.copy(selectionMode = next) }
+        showToast(if (next) "Multi-select on: tap clips to add them" else "Multi-select off")
+    }
+
+    /**
+     * Applies an edit to the selected clip. On a clip with keyframes the edit is routed into
+     * the animation (see [KeyframeOps.reconcileEdit]): the transform shows and edits the values
+     * under the playhead, so a slider always changes what is on screen.
+     */
     fun updateSelectedClip(transform: (TimelineClip) -> TimelineClip) {
         val s = _uiState.value
         val id = s.selectedClipId ?: return
+        val rc = s.resolvedClips.find { it.clip.id == id }
         _uiState.update { state ->
             state.copy(
-                clips = state.clips.map { c -> if (c.id == id) transform(c) else c }
+                clips = state.clips.map { c ->
+                    when {
+                        c.id != id -> c
+                        c.keyframes.isEmpty() || rc == null -> transform(c)
+                        else -> {
+                            val localT = (state.playheadSec - rc.start).coerceIn(0.0, rc.duration)
+                            val shown = EditorUiState.shownAt(c, localT)
+                            KeyframeOps.reconcileEdit(shown, transform(shown), localT)
+                        }
+                    }
+                }
             )
         }
         recalcAndSync("Edited locally")
     }
+
+    /** Applies the same change to every selected clip (bulk colour, volume, speed…). */
+    fun updateSelectedClips(transform: (TimelineClip) -> TimelineClip) {
+        val s = _uiState.value
+        val ids = editableSelection(s)
+        if (ids.isEmpty()) return
+        _uiState.update { state -> state.copy(clips = state.clips.map { if (it.id in ids) transform(it) else it }) }
+        recalcAndSync("Edited ${ids.size} clip(s)")
+    }
+
+    /** Selected clips that sit on unlocked tracks — the ones an edit may touch. */
+    private fun editableSelection(s: EditorUiState): Set<String> {
+        val ids = s.selectionIds
+        return s.clips.filter { it.id in ids && s.trackStates[it.track]?.locked != true }.map { it.id }.toSet()
+    }
+
+    private fun lockedTracks(s: EditorUiState): Set<TimelineTrack> =
+        s.trackStates.filterValues { it.locked }.keys
 
     fun moveOrTrimClip(
         clipId: String,
@@ -853,8 +1256,10 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
 
         val updatedTrimIn = newTrimInSec?.coerceIn(0.0, max(0.0, (newTrimOutSec ?: target.trimOut) - 0.1)) ?: target.trimIn
         val updatedTrimOut = newTrimOutSec?.coerceIn(updatedTrimIn + 0.1, maxOut) ?: target.trimOut
-        val destTrack = newTrack ?: target.track
-        val dur = max(0.1, updatedTrimOut - updatedTrimIn)
+        val destTrack = (newTrack ?: target.track).takeIf {
+            it == target.track || (TimelineOps.canPlace(target, asset, it) && s.trackStates[it]?.locked != true)
+        } ?: target.track
+        val dur = TimelineEngine.clipDuration(target.copy(trimIn = updatedTrimIn, trimOut = updatedTrimOut), s.assetsById)
 
         val resolvedStart = if (desiredStartSec != null) {
             TimelineEngine.resolveTimelineStart(
@@ -867,7 +1272,8 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                 allClips = s.clips,
                 assetsById = s.assetsById,
                 playhead = s.playheadSec,
-                magneticSnap = s.magneticSnap
+                magneticSnap = s.magneticSnap,
+                extraSnapTimes = TimelineOps.snapTimes(s.resolvedClips, setOf(clipId), s.markers)
             )
         } else target.startAt
 
@@ -888,52 +1294,49 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         recalcAndSync("Timeline edit changed")
     }
 
-    fun splitAtPlayhead() {
-        val s = _uiState.value
-        val c = s.selectedClip ?: run {
-            showToast("Select a clip first")
-            return
+    /**
+     * Clips an at-the-playhead edit applies to: the selected clips under the playhead, or — when
+     * none of the selection is there — every clip under it on an unlocked track.
+     */
+    private fun clipsUnderPlayhead(s: EditorUiState, selectionOnly: Boolean): Set<String> {
+        val under = s.resolvedClips.filter { rc ->
+            s.playheadSec > rc.start + TimelineOps.MIN_PIECE && s.playheadSec < rc.end - TimelineOps.MIN_PIECE &&
+                s.trackStates[rc.clip.track]?.locked != true
         }
-        val rc = s.resolvedClips.find { it.clip.id == c.id } ?: return
-        if (s.playheadSec <= rc.start + 0.05 || s.playheadSec >= rc.end - 0.05) {
-            showToast("Move playhead inside the selected clip")
+        val selected = under.filter { it.clip.id in s.selectionIds }
+        return (if (selected.isNotEmpty() || selectionOnly) selected else under).map { it.clip.id }.toSet()
+    }
+
+    /** Splits the selected clips under the playhead; with nothing selected there, every clip under it. */
+    fun splitAtPlayhead(allTracks: Boolean = false) {
+        val s = _uiState.value
+        val targets = if (allTracks) null else clipsUnderPlayhead(s, selectionOnly = false)
+        val edit = if (targets != null && targets.isEmpty()) null
+        else TimelineOps.splitAt(s.clips, s.assetsById, s.playheadSec, targets, lockedTracks(s))
+        if (edit == null) {
+            showToast("Move the playhead inside a clip to split it")
             return
         }
         snapHistory()
-        val cutPoint = c.trimIn + (s.playheadSec - rc.start)
-        val leftClip = c.copy(trimOut = cutPoint)
-        val rightClip = c.copy(
-            id = generateUid(),
-            startAt = s.playheadSec,
-            trimIn = cutPoint,
-            trimOut = c.trimOut,
-            label = "${c.label} (B)"
-        )
-        val nextClips = mutableListOf<TimelineClip>()
-        for (item in s.clips) {
-            if (item.id == c.id) {
-                nextClips.add(leftClip)
-                nextClips.add(rightClip)
-            } else {
-                nextClips.add(item)
-            }
-        }
         _uiState.update {
             it.copy(
-                clips = nextClips,
-                selectedClipId = rightClip.id,
-                selectedClipIds = setOf(rightClip.id)
+                clips = edit.clips,
+                selectedClipId = edit.affectedIds.lastOrNull(),
+                selectedClipIds = edit.affectedIds
             )
         }
         recalcAndSync("Clip split")
-        showToast("Clip split at ${formatTimecode(s.playheadSec)}")
+        showToast(
+            if (edit.affectedIds.size > 1) "${edit.affectedIds.size} clips split at ${formatTimecode(s.playheadSec)}"
+            else "Clip split at ${formatTimecode(s.playheadSec)}"
+        )
     }
 
     fun deleteSelectedClips() {
         val s = _uiState.value
-        val idsToRemove = if (s.selectedClipIds.isNotEmpty()) s.selectedClipIds else setOfNotNull(s.selectedClipId)
+        val idsToRemove = editableSelection(s)
         if (idsToRemove.isEmpty()) {
-            showToast("Select a clip first")
+            showToast(if (s.selectionIds.isEmpty()) "Select a clip first" else "The selected clips are on locked tracks.")
             return
         }
         snapHistory()
@@ -948,23 +1351,16 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         showToast(if (idsToRemove.size > 1) "${idsToRemove.size} clips deleted" else "Clip deleted")
     }
 
+    /** Deletes the selection and closes the holes it leaves, on each affected track. */
     fun rippleDeleteSelectedClip() {
         val s = _uiState.value
-        val c = s.selectedClip ?: run {
-            showToast("Select a clip first")
+        val ids = editableSelection(s)
+        if (ids.isEmpty()) {
+            showToast(if (s.selectionIds.isEmpty()) "Select a clip first" else "The selected clips are on locked tracks.")
             return
         }
-        val rc = s.resolvedClips.find { it.clip.id == c.id } ?: return
-        val gap = rc.duration
-        val track = c.track
-        val cutStart = rc.start
         snapHistory()
-        val updated = s.clips.filter { it.id != c.id }.map { other ->
-            val otherStart = s.resolvedClips.find { it.clip.id == other.id }?.start ?: other.startAt
-            if (other.track == track && otherStart > cutStart + 0.001) {
-                other.copy(startAt = max(cutStart, otherStart - gap))
-            } else other
-        }
+        val updated = TimelineOps.rippleDelete(s.clips, s.assetsById, ids)
         _uiState.update {
             it.copy(
                 clips = updated,
@@ -972,56 +1368,408 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                 selectedClipIds = emptySet()
             )
         }
-        recalcAndSync("Ripple deleted clip")
-        showToast("Deleted clip and closed the gap on ${track.label}")
+        recalcAndSync("Ripple deleted")
+        showToast(if (ids.size > 1) "Deleted ${ids.size} clips and closed the gaps" else "Deleted clip and closed the gap")
+    }
+
+    /**
+     * Trims the clips under the playhead to it. [keepTail] removes everything before the
+     * playhead (Q), otherwise everything after it (W); [ripple] closes the hole that leaves.
+     */
+    fun trimToPlayhead(keepTail: Boolean, ripple: Boolean) {
+        val s = _uiState.value
+        val targets = clipsUnderPlayhead(s, selectionOnly = false)
+        if (targets.isEmpty()) {
+            showToast("Move the playhead inside a clip to trim it")
+            return
+        }
+        var clips = s.clips
+        var changed = 0
+        for (id in targets) {
+            val next = TimelineOps.trimToTime(clips, s.assetsById, id, s.playheadSec, keepTail, ripple) ?: continue
+            clips = next
+            changed++
+        }
+        if (changed == 0) return
+        snapHistory()
+        // A rippled head trim pulls the cut back to where the clip began; follow it.
+        val newPlayhead = if (keepTail && ripple) {
+            s.resolvedClips.filter { it.clip.id in targets }.minOf { it.start }
+        } else s.playheadSec
+        _uiState.update { it.copy(clips = clips, playheadSec = newPlayhead) }
+        recalcAndSync("Trimmed to playhead")
+        showToast(if (keepTail) "Trimmed start to playhead" else "Trimmed end to playhead")
+    }
+
+    /**
+     * Packs clips end to end: on [onlyTrack] when given, otherwise on the tracks of the
+     * selection, or on every unlocked track when nothing is selected.
+     */
+    fun closeGaps(onlyTrack: TimelineTrack? = null) {
+        val s = _uiState.value
+        val selectedTracks = if (onlyTrack != null) setOf(onlyTrack)
+        else s.clips.filter { it.id in s.selectionIds }.map { it.track }.toSet()
+        val tracks = (selectedTracks.ifEmpty { TimelineTrack.entries.toSet() }) - lockedTracks(s)
+        val updated = TimelineOps.closeAllGaps(s.clips, s.assetsById, tracks)
+        if (updated == s.clips) {
+            showToast("No gaps to close.")
+            return
+        }
+        snapHistory()
+        _uiState.update { it.copy(clips = updated) }
+        recalcAndSync("Gaps closed")
+        showToast("Gaps closed")
+    }
+
+    /** Closes the single gap under [atSec] on [track] (right-click an empty stretch of a track). */
+    fun closeGapAt(track: TimelineTrack, atSec: Double) {
+        val s = _uiState.value
+        if (s.trackStates[track]?.locked == true) {
+            showToast("${track.label} is locked.")
+            return
+        }
+        val updated = TimelineOps.closeGapAt(s.clips, s.assetsById, track, atSec)
+        if (updated == null) {
+            showToast("There is no gap here to close.")
+            return
+        }
+        snapHistory()
+        _uiState.update { it.copy(clips = updated) }
+        recalcAndSync("Gap closed")
+        showToast("Gap closed on ${track.label}")
+    }
+
+    /** Opens [lengthSec] of empty space on [track] at [atSec], pushing later clips right. */
+    fun insertGapAt(track: TimelineTrack, atSec: Double, lengthSec: Double = 1.0) {
+        val s = _uiState.value
+        if (s.trackStates[track]?.locked == true) {
+            showToast("${track.label} is locked.")
+            return
+        }
+        snapHistory()
+        _uiState.update { it.copy(clips = TimelineOps.insertSpace(s.clips, s.assetsById, track, atSec, lengthSec)) }
+        recalcAndSync("Gap inserted")
+        showToast("Inserted ${"%.1f".format(lengthSec)} s on ${track.label}")
     }
 
     fun duplicateSelectedClips() {
         val s = _uiState.value
-        val group = if (s.selectedClipIds.size > 1) {
-            s.clips.filter { it.id in s.selectedClipIds }
-        } else {
-            listOfNotNull(s.selectedClip)
-        }
+        val ids = editableSelection(s)
+        val group = s.resolvedClips.filter { it.clip.id in ids }
         if (group.isEmpty()) {
             showToast("Select a clip first")
             return
         }
         snapHistory()
-        val spanShift = group.maxOf { TimelineEngine.sourceSpanDuration(it, s.assetsById) }.coerceAtLeast(0.1)
-        val copies = group.map { orig ->
-            val st = s.resolvedClips.find { it.clip.id == orig.id }?.start ?: orig.startAt
-            orig.copy(
-                id = generateUid(),
-                startAt = st + spanShift,
-                label = "${orig.label} copy"
-            )
-        }
+        // The copies keep the group's spacing and land directly after it.
+        val edit = TimelineOps.paste(
+            s.clips, s.assetsById,
+            group.map { it.clip.copy(startAt = it.start, label = "${it.clip.label} copy") },
+            group.maxOf { it.end }
+        )
         _uiState.update {
             it.copy(
-                clips = it.clips + copies,
-                selectedClipId = copies.first().id,
-                selectedClipIds = copies.map { c -> c.id }.toSet()
+                clips = edit.clips,
+                selectedClipId = edit.affectedIds.firstOrNull(),
+                selectedClipIds = edit.affectedIds
             )
         }
         recalcAndSync("Clip duplicated")
-        showToast(if (copies.size > 1) "${copies.size} clips duplicated" else "Clip duplicated")
+        showToast(if (edit.affectedIds.size > 1) "${edit.affectedIds.size} clips duplicated" else "Clip duplicated")
+    }
+
+    // ---- Clip clipboard
+
+    fun copySelectedClips(): Boolean {
+        val s = _uiState.value
+        val group = s.resolvedClips.filter { it.clip.id in s.selectionIds }
+        if (group.isEmpty()) {
+            showToast("Select a clip first")
+            return false
+        }
+        _uiState.update { it.copy(clipClipboard = group.map { rc -> rc.clip.copy(startAt = rc.start) }) }
+        showToast(if (group.size > 1) "${group.size} clips copied" else "Clip copied")
+        return true
+    }
+
+    fun cutSelectedClips() {
+        val s = _uiState.value
+        val ids = editableSelection(s)
+        val group = s.resolvedClips.filter { it.clip.id in ids }
+        if (group.isEmpty()) {
+            showToast(if (s.selectionIds.isEmpty()) "Select a clip first" else "The selected clips are on locked tracks.")
+            return
+        }
+        snapHistory()
+        _uiState.update {
+            it.copy(
+                clipClipboard = group.map { rc -> rc.clip.copy(startAt = rc.start) },
+                clips = it.clips.filterNot { c -> c.id in ids },
+                selectedClipId = null,
+                selectedClipIds = emptySet()
+            )
+        }
+        recalcAndSync("Clips cut")
+        showToast(if (group.size > 1) "${group.size} clips cut" else "Clip cut")
+    }
+
+    /** Pastes the clipboard at [atSec] (the playhead by default), keeping the clips' spacing and tracks. */
+    fun pasteClips(atSec: Double? = null) {
+        val s = _uiState.value
+        val locked = lockedTracks(s)
+        // Clips whose media has since left the library cannot be pasted.
+        val usable = s.clipClipboard.filter { (it.assetId == null || s.assetsById.containsKey(it.assetId)) && it.track !in locked }
+        if (usable.isEmpty()) {
+            showToast(if (s.clipClipboard.isEmpty()) "Copy or cut a clip first" else "Nothing on the clipboard can be pasted here.")
+            return
+        }
+        snapHistory()
+        val edit = TimelineOps.paste(s.clips, s.assetsById, usable, atSec ?: s.playheadSec)
+        _uiState.update {
+            it.copy(clips = edit.clips, selectedClipId = edit.affectedIds.firstOrNull(), selectedClipIds = edit.affectedIds)
+        }
+        recalcAndSync("Clips pasted")
+        showToast(if (edit.affectedIds.size > 1) "${edit.affectedIds.size} clips pasted" else "Clip pasted")
+    }
+
+    // ---- Moving the selection
+
+    /**
+     * Moves every selected clip by [deltaSec] together. The group stops at the first obstacle on
+     * any of its tracks, so a group move can never overlap clips. Returns the distance moved.
+     * Call [snapHistory] first; a drag calls this many times for one undo step.
+     */
+    fun moveSelectionBy(deltaSec: Double, ids: Set<String>? = null): Double {
+        val s = _uiState.value
+        val group = (ids ?: s.selectionIds).filter { id ->
+            s.clips.find { it.id == id }?.let { s.trackStates[it.track]?.locked != true } == true
+        }.toSet()
+        if (group.isEmpty() || deltaSec == 0.0) return 0.0
+        val applied = TimelineOps.clampGroupDelta(s.resolvedClips, group, deltaSec)
+        if (applied == 0.0) return 0.0
+        _uiState.update { it.copy(clips = TimelineOps.moveGroup(it.clips, it.assetsById, group, deltaSec)) }
+        recalcAndSync("Timeline edit changed")
+        return applied
+    }
+
+    /**
+     * Where a group drag should land: [wantedDeltaSec] adjusted so an edge of the dragged clip
+     * snaps to a nearby cut, marker or the playhead (when snapping is on).
+     */
+    fun snapGroupDelta(
+        anchorClipId: String,
+        wantedDeltaSec: Double,
+        group: Set<String>,
+        scalePxPerSec: Double = _uiState.value.timelineZoomPxPerSec
+    ): Double {
+        val s = _uiState.value
+        if (!s.magneticSnap || scalePxPerSec <= 0.0) return wantedDeltaSec
+        val anchor = s.resolvedClips.find { it.clip.id == anchorClipId } ?: return wantedDeltaSec
+        val targets = TimelineOps.snapTimes(s.resolvedClips, group, s.markers) + s.playheadSec
+        val start = anchor.start + wantedDeltaSec
+        val end = start + anchor.duration
+        var best = wantedDeltaSec
+        var bestPx = 11.0
+        for (t in targets) {
+            val dStart = abs(t - start) * scalePxPerSec
+            if (dStart < bestPx) { bestPx = dStart; best = t - anchor.start }
+            val dEnd = abs(t - end) * scalePxPerSec
+            if (dEnd < bestPx) { bestPx = dEnd; best = t - anchor.end }
+        }
+        return best
+    }
+
+    /**
+     * One step of dragging clips along the timeline. [desiredAnchorStartSec] is where the clip
+     * under the pointer should now begin. A single clip may also change track and hop over its
+     * neighbours; a group keeps its shape and stops at the first obstacle. Call [snapHistory]
+     * once when the drag starts.
+     */
+    fun dragClipsTo(
+        anchorClipId: String,
+        group: Set<String>,
+        desiredAnchorStartSec: Double,
+        targetTrack: TimelineTrack?,
+        scalePxPerSec: Double
+    ) {
+        val s = _uiState.value
+        val anchor = s.resolvedClips.find { it.clip.id == anchorClipId } ?: return
+        if (group.size <= 1) {
+            moveOrTrimClip(anchorClipId, targetTrack, max(0.0, desiredAnchorStartSec), null, null, scalePxPerSec)
+            return
+        }
+        val wanted = max(0.0, desiredAnchorStartSec) - anchor.start
+        if (abs(wanted) < 1e-6) return
+        moveSelectionBy(snapGroupDelta(anchorClipId, wanted, group, scalePxPerSec), group)
+    }
+
+    /**
+     * One step of dragging a clip edge. [origin] and [originStartSec] describe the clip when the
+     * drag began and [deltaSec] the distance dragged since, so the whole gesture is one clean
+     * edit. Call [snapHistory] once when the drag starts.
+     */
+    fun trimClipEdge(origin: TimelineClip, originStartSec: Double, head: Boolean, deltaSec: Double, scalePxPerSec: Double) {
+        val s = _uiState.value
+        if (s.clips.none { it.id == origin.id }) return
+        if (s.trackStates[origin.track]?.locked == true) {
+            showToast("This track is locked. Unlock it before editing.")
+            return
+        }
+        val snapTimes = if (s.magneticSnap) {
+            TimelineOps.snapTimes(s.resolvedClips, setOf(origin.id), s.markers) + s.playheadSec
+        } else emptyList()
+        val window = if (s.magneticSnap && scalePxPerSec > 0.0) 11.0 / scalePxPerSec else 0.0
+        val trimmed = TimelineOps.trimEdge(s.clips, s.assetsById, origin, originStartSec, head, deltaSec, snapTimes, window)
+        _uiState.update { st -> st.copy(clips = st.clips.map { if (it.id == origin.id) trimmed.copy(track = it.track) else it }) }
+        recalcAndSync("Timeline edit changed")
+    }
+
+    /** Runs an entry of the clip context menu on the current selection. */
+    fun performClipMenuAction(action: ClipMenuAction) {
+        when (action) {
+            ClipMenuAction.CUT -> cutSelectedClips()
+            ClipMenuAction.COPY -> copySelectedClips()
+            ClipMenuAction.PASTE -> pasteClips()
+            ClipMenuAction.DUPLICATE -> duplicateSelectedClips()
+            ClipMenuAction.SPLIT -> splitAtPlayhead()
+            ClipMenuAction.TRIM_START -> trimToPlayhead(keepTail = true, ripple = false)
+            ClipMenuAction.TRIM_END -> trimToPlayhead(keepTail = false, ripple = false)
+            ClipMenuAction.DETACH_AUDIO -> detachAudioFromSelection()
+            ClipMenuAction.REPLACE_MEDIA -> {
+                val assetId = _uiState.value.selectedAssetId
+                if (assetId == null) showToast("Select the replacement in the media library first")
+                else replaceSelectedClipMedia(assetId)
+            }
+            ClipMenuAction.KEYFRAME -> addOrUpdateKeyframeAtPlayhead()
+            ClipMenuAction.COPY_PROPS -> copySelectedClipAttributes()
+            ClipMenuAction.PASTE_PROPS -> pasteClipAttributesToSelected()
+            ClipMenuAction.RESET_PROPS -> resetSelectedClipEffectsAndTransform()
+            ClipMenuAction.RIPPLE_DELETE -> rippleDeleteSelectedClip()
+            ClipMenuAction.DELETE -> deleteSelectedClips()
+            ClipMenuAction.DETECT_BEATS -> detectBeatsOnSelectedClip()
+            ClipMenuAction.PRESET_HUB -> setShowPresetsModal(true)
+            ClipMenuAction.GRADE_SPLIT -> toggleGradeSplitWipe()
+            ClipMenuAction.MODE_EDIT -> setWorkspaceMode(WorkspaceMode.EDIT)
+            ClipMenuAction.MODE_COLOR -> setWorkspaceMode(WorkspaceMode.COLOR)
+            ClipMenuAction.MODE_MOTION -> setWorkspaceMode(WorkspaceMode.MOTION)
+            ClipMenuAction.MODE_MUSIC -> setWorkspaceMode(WorkspaceMode.MUSIC)
+            ClipMenuAction.RIG_ARRI -> applyEquipmentRig("ARRI Alexa Mini LF · Cooke S4 35mm")
+            ClipMenuAction.RIG_RED -> applyEquipmentRig("RED V-Raptor 8K · Atlas Orion 2x Anamorphic")
+            ClipMenuAction.AUDIO_SSL -> applyAudioGearPreset("SSL 4000G Master Bus Glue")
+        }
+    }
+
+    /** Moves the selection to another track when every selected clip is allowed there. */
+    fun moveSelectionToTrack(track: TimelineTrack) {
+        val s = _uiState.value
+        if (s.trackStates[track]?.locked == true) {
+            showToast("${track.label} is locked.")
+            return
+        }
+        val ids = editableSelection(s)
+        val group = s.resolvedClips.filter { it.clip.id in ids && it.clip.track != track }
+        if (group.isEmpty()) return
+        if (group.any { !TimelineOps.canPlace(it.clip, it.clip.assetId?.let { id -> s.assetsById[id] }, track) }) {
+            showToast("Those clips cannot go on ${track.label}.")
+            return
+        }
+        snapHistory()
+        var clips = s.clips.filterNot { it.id in ids && it.track != track }
+        for (rc in group.sortedBy { it.start }) {
+            val start = TimelineEngine.resolveTimelineStart(
+                desired = rc.start, duration = rc.duration, track = track, clipId = rc.clip.id,
+                scalePxPerSec = 0.0, direction = 1.0, allClips = clips, assetsById = s.assetsById,
+                playhead = s.playheadSec, magneticSnap = false
+            )
+            clips = clips + rc.clip.copy(track = track, startAt = start)
+        }
+        _uiState.update { it.copy(clips = clips) }
+        recalcAndSync("Moved to ${track.label}")
+        showToast("Moved ${group.size} clip(s) to ${track.label}")
     }
 
     fun moveSelectedClipToPlayhead() {
         val s = _uiState.value
-        val c = s.selectedClip ?: run { showToast("Select a clip first"); return }
+        val ids = editableSelection(s)
+        val group = s.resolvedClips.filter { it.clip.id in ids }
+        if (group.isEmpty()) {
+            showToast("Select a clip first")
+            return
+        }
         snapHistory()
-        updateSelectedClip { it.copy(startAt = s.playheadSec) }
-        showToast("Clip moved to playhead")
+        moveSelectionBy(s.playheadSec - group.minOf { it.start }, ids)
+        showToast(if (group.size > 1) "Clips moved to playhead" else "Clip moved to playhead")
     }
 
     fun nudgeSelectedClip(deltaSec: Double) {
         val s = _uiState.value
-        val c = s.selectedClip ?: run { showToast("Select a clip first"); return }
-        val st = s.resolvedClips.find { it.clip.id == c.id }?.start ?: c.startAt
+        val ids = editableSelection(s)
+        if (ids.isEmpty()) {
+            showToast("Select a clip first")
+            return
+        }
         snapHistory()
-        updateSelectedClip { it.copy(startAt = max(0.0, st + deltaSec)) }
+        if (moveSelectionBy(deltaSec, ids) == 0.0) showToast("No room to move that way")
+    }
+
+    /** Nudges by whole frames of the project frame rate (the , and . keys). */
+    fun nudgeSelectionFrames(frames: Int) {
+        nudgeSelectedClip(frames.toDouble() / max(1, _uiState.value.projectSettings.fps))
+    }
+
+    /**
+     * Puts a video clip's sound on an audio track as its own clip and silences the original, so
+     * picture and sound can be trimmed, moved and mixed separately.
+     */
+    fun detachAudioFromSelection() {
+        val s = _uiState.value
+        val group = s.resolvedClips.filter { rc ->
+            rc.clip.id in editableSelection(s) && rc.clip.track.isVisual &&
+                s.assetsById[rc.clip.assetId]?.kind == AssetKind.VIDEO
+        }
+        if (group.isEmpty()) {
+            showToast("Select a video clip to detach its audio")
+            return
+        }
+        var clips = s.clips
+        val created = ArrayList<String>()
+        for (rc in group) {
+            val resolved = TimelineEngine.starts(clips, s.assetsById)
+            val track = listOf(TimelineTrack.AUDIO, TimelineTrack.AUDIO2).firstOrNull { t ->
+                s.trackStates[t]?.locked != true &&
+                    resolved.none { it.clip.track == t && it.start < rc.end - 0.001 && it.end > rc.start + 0.001 }
+            } ?: continue
+            val sound = rc.clip.copy(
+                id = generateUid(), track = track, startAt = rc.start,
+                label = "${rc.clip.label} (audio)", keyframes = emptyList(),
+                transition = "none", transitionOut = "none", fadeOut = 0.0
+            )
+            clips = clips.map { if (it.id == rc.clip.id) it.copy(volume = 0.0, volumeKeyframes = emptyList()) else it } + sound
+            created.add(sound.id)
+        }
+        if (created.isEmpty()) {
+            showToast("No free audio track at that position.")
+            return
+        }
+        snapHistory()
+        _uiState.update { it.copy(clips = clips, selectedClipId = created.last(), selectedClipIds = created.toSet()) }
+        recalcAndSync("Audio detached")
+        showToast(if (created.size > 1) "Audio detached from ${created.size} clips" else "Audio detached to its own clip")
+    }
+
+    /** Swaps the media behind the selected clip for a library item, keeping its edit and look. */
+    fun replaceSelectedClipMedia(assetId: String) {
+        val s = _uiState.value
+        val c = s.selectedClip ?: run { showToast("Select a clip first"); return }
+        val asset = s.assetsById[assetId] ?: return
+        if (c.assetId == null || !TimelineOps.canPlace(c.copy(assetId = asset.id), asset, c.track)) {
+            showToast("${asset.name} cannot replace a clip on ${c.track.label}.")
+            return
+        }
+        snapHistory()
+        _uiState.update { st -> st.copy(clips = st.clips.map { if (it.id == c.id) TimelineOps.replaceMedia(it, asset) else it }) }
+        recalcAndSync("Media replaced")
+        showToast("Replaced with ${asset.name}")
     }
 
     fun selectAdjacentClip(direction: Int) {
@@ -1147,7 +1895,10 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                 clipLabel = c.label
             )
             if (freezeAsset != null) {
-                _uiState.update { state -> state.copy(assets = state.assets + freezeAsset) }
+                val owned = ensureProjectId(force = true)?.let { projectStore.adoptAsset(it, freezeAsset) } ?: freezeAsset
+                snapHistory()
+                _uiState.update { state -> state.copy(assets = state.assets + owned, selectedAssetId = owned.id, selectedAssetIds = setOf(owned.id)) }
+                scheduleAutosave()
                 showToast("Freeze-frame image added to library")
             } else {
                 showToast("Could not extract freeze-frame from this video clip.")
@@ -1160,6 +1911,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             val cur = s.trackStates[track] ?: TrackState()
             s.copy(trackStates = s.trackStates + (track to cur.copy(locked = !cur.locked)))
         }
+        scheduleAutosave()
     }
 
     fun toggleTrackHidden(track: TimelineTrack) {
@@ -1167,6 +1919,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             val cur = s.trackStates[track] ?: TrackState()
             s.copy(trackStates = s.trackStates + (track to cur.copy(hidden = !cur.hidden)))
         }
+        scheduleAutosave()
     }
 
     fun toggleTrackMute(track: TimelineTrack) {
@@ -1174,6 +1927,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             val cur = s.trackStates[track] ?: TrackState()
             s.copy(trackStates = s.trackStates + (track to cur.copy(muted = !cur.muted)))
         }
+        scheduleAutosave()
     }
 
     fun toggleTrackSolo(track: TimelineTrack) {
@@ -1181,52 +1935,142 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             val cur = s.trackStates[track] ?: TrackState()
             s.copy(trackStates = s.trackStates + (track to cur.copy(solo = !cur.solo)))
         }
+        scheduleAutosave()
     }
 
-    fun isTrackAudible(track: TimelineTrack): Boolean {
-        val states = _uiState.value.trackStates
-        val ts = states[track] ?: return true
-        if (ts.muted || ts.hidden) return false
-        val anySolo = listOf(TimelineTrack.AUDIO, TimelineTrack.AUDIO2).any { states[it]?.solo == true }
-        return !anySolo || ts.solo
+    fun isTrackAudible(track: TimelineTrack): Boolean =
+        track in TimelineEngine.audibleTracks(_uiState.value.trackStates)
+
+    fun toggleTrackCollapsed(track: TimelineTrack) {
+        _uiState.update { s ->
+            val cur = s.trackStates[track] ?: TrackState()
+            s.copy(trackStates = s.trackStates + (track to cur.copy(collapsed = !cur.collapsed)))
+        }
+        scheduleAutosave()
+    }
+
+    /** Collapses every track, or expands them all again when they are already collapsed. */
+    fun toggleAllTracksCollapsed() {
+        _uiState.update { s ->
+            val collapse = TimelineTrack.entries.any { s.trackStates[it]?.collapsed != true }
+            s.copy(trackStates = TimelineTrack.entries.associateWith { (s.trackStates[it] ?: TrackState()).copy(collapsed = collapse) })
+        }
+        scheduleAutosave()
+    }
+
+    /** Collapses every track that has no clips, leaving the ones in use open. */
+    fun collapseEmptyTracks() {
+        _uiState.update { s ->
+            val used = s.clips.map { it.track }.toSet()
+            s.copy(trackStates = TimelineTrack.entries.associateWith { (s.trackStates[it] ?: TrackState()).copy(collapsed = it !in used) })
+        }
+        scheduleAutosave()
     }
 
     // -------------------------------------------------------------------------
     // KEYFRAMES, MOTION PRESETS, COLOUR LOOKS, CAMERA RIGS & AUDIO GEAR
     // -------------------------------------------------------------------------
+    /** The selected clip with its resolved position, when the playhead is inside it. */
+    private fun selectedAtPlayhead(): Pair<ResolvedClip, Double>? {
+        val s = _uiState.value
+        val id = s.selectedClipId ?: return null
+        val rc = s.resolvedClips.find { it.clip.id == id } ?: return null
+        val localT = ((s.playheadSec - rc.start).coerceIn(0.0, rc.duration) * 1000.0).roundToInt() / 1000.0
+        return rc to localT
+    }
+
+    private fun replaceClip(updated: TimelineClip, status: String) {
+        _uiState.update { st -> st.copy(clips = st.clips.map { if (it.id == updated.id) updated else it }) }
+        recalcAndSync(status)
+    }
+
+    /** Sets a keyframe at the playhead holding the values currently on screen. */
     fun addOrUpdateKeyframeAtPlayhead() {
         val s = _uiState.value
-        val c = s.selectedClip ?: return
-        val rc = s.resolvedClips.find { it.clip.id == c.id } ?: return
-        val localT = ((s.playheadSec - rc.start).coerceIn(0.0, rc.duration) * 1000.0).roundToInt() / 1000.0
-        val anim = TimelineEngine.animatedProps(c, localT)
+        val (rc, localT) = selectedAtPlayhead() ?: run { showToast("Select a clip first"); return }
         snapHistory()
-        val filtered = c.keyframes.filter { abs(it.time - localT) >= 0.08 }
-        val newKf = Keyframe(
-            time = localT,
-            scale = anim.scale,
-            opacity = anim.opacity,
-            rotation = anim.rotation,
-            x = anim.x,
-            y = anim.y,
-            filters = anim.filters
-        )
-        updateSelectedClip { it.copy(keyframes = (filtered + newKf).sortedBy { k -> k.time }) }
+        replaceClip(KeyframeOps.upsert(rc.clip, localT), "Keyframe set")
         showToast("Keyframe set at ${formatTimecode(s.playheadSec)}")
     }
 
+    /** Adds a keyframe at a clip-local time (double-click in the keyframe lane). */
+    fun addKeyframeAt(localT: Double) {
+        val c = _uiState.value.selectedClip ?: return
+        snapHistory()
+        replaceClip(KeyframeOps.upsert(c, localT), "Keyframe set")
+    }
+
+    fun removeKeyframeAtPlayhead() {
+        val (rc, localT) = selectedAtPlayhead() ?: run { showToast("Select a clip first"); return }
+        val index = KeyframeOps.indexAt(rc.clip, localT)
+        if (index < 0) {
+            showToast("No keyframe at the playhead")
+            return
+        }
+        removeKeyframeAtIndex(index)
+        showToast("Keyframe removed")
+    }
+
+    /** [index] is in time order, as shown in the keyframe editor. */
     fun removeKeyframeAtIndex(index: Int) {
         val c = _uiState.value.selectedClip ?: return
         if (index !in c.keyframes.indices) return
         snapHistory()
-        val updated = c.keyframes.toMutableList().apply { removeAt(index) }
-        updateSelectedClip { it.copy(keyframes = updated) }
+        replaceClip(KeyframeOps.remove(c, index), "Keyframe removed")
+    }
+
+    /**
+     * Retimes a keyframe to [newLocalT]. A drag calls this repeatedly, so the caller takes the
+     * undo snapshot once when the drag starts. Returns the keyframe's new index.
+     */
+    fun moveKeyframe(index: Int, newLocalT: Double): Int {
+        val s = _uiState.value
+        val c = s.selectedClip ?: return index
+        val rc = s.resolvedClips.find { it.clip.id == c.id } ?: return index
+        val updated = KeyframeOps.move(c, index, newLocalT, rc.duration)
+        replaceClip(updated, "Keyframe moved")
+        val t = newLocalT.coerceIn(0.0, rc.duration)
+        return KeyframeOps.indexAt(updated, t).takeIf { it >= 0 } ?: index
+    }
+
+    fun setKeyframeEasing(index: Int, easing: String) {
+        val c = _uiState.value.selectedClip ?: return
+        if (index !in c.keyframes.indices) return
+        snapHistory()
+        replaceClip(KeyframeOps.setEasing(c, index, easing), "Keyframe easing changed")
+    }
+
+    /** Edits the values stored in one keyframe, wherever the playhead is. */
+    fun patchKeyframe(index: Int, patch: KeyframePatch) {
+        val c = _uiState.value.selectedClip ?: return
+        val k = c.keyframes.sortedBy { it.time }.getOrNull(index) ?: return
+        replaceClip(KeyframeOps.upsert(c, k.time, patch), "Keyframe edited")
+    }
+
+    /** Moves the playhead to the previous / next keyframe of the selected clip. */
+    fun jumpToKeyframe(direction: Int) {
+        val s = _uiState.value
+        val c = s.selectedClip ?: run { showToast("Select a clip first"); return }
+        val rc = s.resolvedClips.find { it.clip.id == c.id } ?: return
+        val localT = s.playheadSec - rc.start
+        val target = if (direction < 0) KeyframeOps.prevTime(c, localT) else KeyframeOps.nextTime(c, localT)
+        if (target == null) {
+            showToast(if (c.keyframes.isEmpty()) "This clip has no keyframes" else if (direction < 0) "No earlier keyframe" else "No later keyframe")
+            return
+        }
+        seekTo(rc.start + target)
     }
 
     fun clearKeyframesOnSelectedClip() {
         if (_uiState.value.selectedClip == null) return
         snapHistory()
         updateSelectedClip { it.copy(keyframes = emptyList()) }
+    }
+
+    fun toggleKeyframeLane() {
+        val next = !_uiState.value.showKeyframeLane
+        prefs.edit().putBoolean("keyframe_lane", next).apply()
+        _uiState.update { it.copy(showKeyframeLane = next) }
     }
 
     fun applyLookPreset(preset: LookPreset) {
@@ -1242,7 +2086,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
     fun applyMotionPreset(presetName: String) {
         val s = _uiState.value
         val c = s.selectedClip ?: run { showToast("Select a timeline clip first."); return }
-        val dur = TimelineEngine.sourceSpanDuration(c, s.assetsById)
+        val dur = TimelineEngine.clipDuration(c, s.assetsById)
         snapHistory()
         val customSteps = s.customMotionPresets[presetName]
         val updated = if (customSteps != null) {
@@ -1270,7 +2114,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         val s = _uiState.value
         val rigPreset = s.allEquipmentRigs[name] ?: return
         val c = s.selectedClip ?: run { showToast("Select a clip first"); return }
-        val dur = TimelineEngine.sourceSpanDuration(c, s.assetsById)
+        val dur = TimelineEngine.clipDuration(c, s.assetsById)
         snapHistory()
         updateSelectedClip { cur ->
             var next = cur.copy(
@@ -1358,13 +2202,41 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
     // -------------------------------------------------------------------------
     // MARKERS & TRANSPORT PLAYBACK
     // -------------------------------------------------------------------------
-    fun addMarkerAtPlayhead(customLabel: String? = null) {
+    fun addMarkerAtPlayhead(customLabel: String? = null) = addMarkerAt(_uiState.value.playheadSec, customLabel)
+
+    fun addMarkerAt(timeSec: Double, customLabel: String? = null) {
         snapHistory()
         val s = _uiState.value
+        val t = timeSec.coerceAtLeast(0.0)
         val label = customLabel?.trim()?.takeIf { it.isNotEmpty() } ?: "Marker ${s.markers.size + 1}"
-        val next = (s.markers + TimelineMarker(time = s.playheadSec, label = label)).sortedBy { it.time }
+        val next = (s.markers.filterNot { abs(it.time - t) < 0.01 } + TimelineMarker(time = t, label = label)).sortedBy { it.time }
         _uiState.update { it.copy(markers = next) }
-        showToast("Marker added at ${formatTimecode(s.playheadSec)}")
+        scheduleAutosave()
+        showToast("Marker added at ${formatTimecode(t)}")
+    }
+
+    fun removeMarker(marker: TimelineMarker) {
+        if (marker !in _uiState.value.markers) return
+        snapHistory()
+        _uiState.update { it.copy(markers = it.markers - marker) }
+        scheduleAutosave()
+        showToast("Marker removed")
+    }
+
+    fun renameMarker(marker: TimelineMarker, label: String) {
+        val clean = label.trim()
+        if (clean.isEmpty() || marker !in _uiState.value.markers) return
+        snapHistory()
+        _uiState.update { it.copy(markers = it.markers.map { m -> if (m == marker) m.copy(label = clean) else m }) }
+        scheduleAutosave()
+    }
+
+    fun clearMarkers() {
+        if (_uiState.value.markers.isEmpty()) return
+        snapHistory()
+        _uiState.update { it.copy(markers = emptyList()) }
+        scheduleAutosave()
+        showToast("All markers removed")
     }
 
     fun jumpToMarker(direction: Int) {
@@ -1387,44 +2259,58 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         val clamped = timeSec.coerceIn(0.0, max(0.0, s.durationSec))
         _uiState.update { it.copy(playheadSec = clamped) }
         // While playing, re-cue the audio so it follows the new position.
-        if (s.isPlaying) {
-            previewAudio.start(
-                scope = viewModelScope,
-                clips = s.resolvedClips,
-                assets = s.assetsById,
-                audibleTracks = audibleAudioTracks(),
-                fromSec = clamped
-            )
-        }
+        if (s.isPlaying) cueAudio(clamped)
     }
 
-    /** Audio tracks that should currently be heard (mute, hide and solo resolved). */
-    private fun audibleAudioTracks(): Set<TimelineTrack> =
-        listOf(TimelineTrack.AUDIO, TimelineTrack.AUDIO2).filter { isTrackAudible(it) }.toSet()
-
-    fun togglePlayPause() {
+    /** Sound is previewed at normal speed only; shuttling faster or backwards is silent. */
+    private fun cueAudio(fromSec: Double) {
         val s = _uiState.value
-        if (s.isPlaying) {
-            pausePlayback()
+        if (s.shuttleRate != 1.0) {
+            previewAudio.stop()
             return
         }
-        if (s.durationSec <= 0.0) {
-            showToast("Add clips to the timeline first")
-            return
-        }
-        if (s.playheadSec >= s.durationSec - 0.02) {
-            _uiState.update { it.copy(playheadSec = 0.0) }
-        }
-        _uiState.update { it.copy(isPlaying = true) }
-
-        // Cue the audio for everything from the playhead onward.
         previewAudio.start(
             scope = viewModelScope,
             clips = s.resolvedClips,
             assets = s.assetsById,
-            audibleTracks = audibleAudioTracks(),
-            fromSec = _uiState.value.playheadSec
+            audibleTracks = TimelineEngine.audibleTracks(s.trackStates),
+            fromSec = fromSec
         )
+    }
+
+    fun togglePlayPause() {
+        if (_uiState.value.isPlaying) pausePlayback() else startPlayback(1.0)
+    }
+
+    /**
+     * J / K / L transport. L plays forwards and J backwards; pressing the same key again doubles
+     * the speed up to 8x, and K (or [direction] 0) stops.
+     */
+    fun shuttle(direction: Int) {
+        val s = _uiState.value
+        if (direction == 0) {
+            pausePlayback()
+            return
+        }
+        val sign = if (direction > 0) 1.0 else -1.0
+        val rate = if (s.isPlaying && s.shuttleRate * sign > 0.0) {
+            sign * min(8.0, abs(s.shuttleRate) * 2.0)
+        } else sign
+        startPlayback(rate)
+        if (abs(rate) != 1.0 || rate < 0.0) showToast(if (rate < 0.0) "◀ ${abs(rate).roundToInt()}x" else "▶ ${rate.roundToInt()}x")
+    }
+
+    private fun startPlayback(rate: Double) {
+        val s = _uiState.value
+        if (s.durationSec <= 0.0) {
+            showToast("Add clips to the timeline first")
+            return
+        }
+        var from = s.playheadSec
+        if (rate > 0.0 && from >= s.durationSec - 0.02) from = 0.0
+        if (rate < 0.0 && from <= 0.02) from = s.durationSec
+        _uiState.update { it.copy(isPlaying = true, shuttleRate = rate, playheadSec = from) }
+        cueAudio(from)
 
         playbackJob?.cancel()
         playbackJob = viewModelScope.launch {
@@ -1433,15 +2319,21 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             while (isActive && _uiState.value.isPlaying) {
                 delay(16L) // ~60fps frame ticker
                 val now = System.currentTimeMillis()
-                val dt = ((now - lastMs) / 1000.0).coerceIn(0.0, 0.1)
+                // The sound runs on the real clock, so the playhead has to keep up with it: a
+                // tick that arrives late moves the playhead by the time that really passed.
+                // The ceiling only guards against a clock jump or a long freeze.
+                val dt = ((now - lastMs) / 1000.0).coerceIn(0.0, 0.5)
                 lastMs = now
                 val cur = _uiState.value
                 tick++
                 // Refresh fades/automation a few times a second rather than every frame.
-                if (tick % 6 == 0) previewAudio.updateVolumes(cur.resolvedClips, cur.playheadSec)
-                val nextTime = cur.playheadSec + dt
+                if (tick % 6 == 0 && cur.shuttleRate == 1.0) previewAudio.updateVolumes(cur.resolvedClips, cur.playheadSec)
+                val nextTime = cur.playheadSec + dt * cur.shuttleRate
                 if (nextTime >= cur.durationSec) {
-                    _uiState.update { it.copy(playheadSec = cur.durationSec, isPlaying = false) }
+                    _uiState.update { it.copy(playheadSec = cur.durationSec, isPlaying = false, shuttleRate = 1.0) }
+                    break
+                } else if (nextTime <= 0.0) {
+                    _uiState.update { it.copy(playheadSec = 0.0, isPlaying = false, shuttleRate = 1.0) }
                     break
                 } else {
                     _uiState.update { it.copy(playheadSec = nextTime) }
@@ -1454,17 +2346,40 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
     fun pausePlayback() {
         playbackJob?.cancel()
         previewAudio.stop()
-        _uiState.update { it.copy(isPlaying = false) }
+        _uiState.update { it.copy(isPlaying = false, shuttleRate = 1.0) }
+    }
+
+    /** Steps the playhead by whole frames of the project frame rate, pausing first. */
+    fun stepFrames(frames: Int) {
+        if (_uiState.value.isPlaying) pausePlayback()
+        val s = _uiState.value
+        val fps = max(1, s.projectSettings.fps)
+        // Step from the frame the playhead is on, so repeated steps do not drift off the grid.
+        val frame = Math.round(s.playheadSec * fps) + frames
+        seekTo(frame.toDouble() / fps)
+    }
+
+    /** Moves the playhead to the previous / next cut (the start or end of any clip). */
+    fun jumpToEditPoint(direction: Int) {
+        val s = _uiState.value
+        val target = if (direction < 0) TimelineOps.prevEditPoint(s.resolvedClips, s.playheadSec)
+        else TimelineOps.nextEditPoint(s.resolvedClips, s.playheadSec)
+        if (target == null) {
+            showToast(if (direction < 0) "No earlier cut." else "No later cut.")
+            return
+        }
+        seekTo(target)
     }
 
     // -------------------------------------------------------------------------
     // 1-CLICK PRO DEMO REEL GENERATOR
     // -------------------------------------------------------------------------
     fun loadProDemoReel() {
-        snapHistory()
+        // The demo is a project of its own, so loading it never replaces the user's edit.
+        if (!createProject("Pro Demo Reel", announce = false)) return
+        val projectId = _uiState.value.currentProjectId ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val ctx = getApplication<Application>()
-            val mediaDir = File(ctx.filesDir, "media").apply { mkdirs() }
+            val mediaDir = projectStore.mediaDir(projectId)
             val img1File = MediaEngine.createSyntheticDemoImageFile(
                 File(mediaDir, "demo_scene01.png"),
                 "SCENE 01 · ARRI ALEXA LF",
@@ -1570,6 +2485,8 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             )
 
             withContext(Dispatchers.Main) {
+                // The user may have left the demo project while its media was being generated.
+                if (_uiState.value.currentProjectId != projectId) return@withContext
                 _uiState.update { s ->
                     val nextAssets = s.assets + listOf(a1, a2, a3, a4)
                     val nextClips = listOf(c1, c2, cPip, cTxt, cAud)
@@ -1647,25 +2564,178 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         showToast("Timeline cleared; media library preserved")
     }
 
+    /** Resets the editor to an empty edit. Layout, presets and preferences are kept. */
+    private fun resetEditor(name: String, settings: ProjectSettings, projectId: String?) {
+        pausePlayback()
+        history.clear()
+        future.clear()
+        _uiState.update {
+            it.copy(
+                currentProjectId = projectId,
+                projectName = name,
+                projectSettings = settings,
+                exportSettings = exportSettingsFor(settings, it.exportSettings),
+                assets = emptyList(),
+                clips = emptyList(),
+                markers = emptyList(),
+                trackStates = TimelineTrack.entries.associateWith { TrackState() },
+                selectedAssetId = null,
+                selectedAssetIds = emptySet(),
+                selectedClipId = null,
+                selectedClipIds = emptySet(),
+                clipClipboard = emptyList(),
+                playheadSec = 0.0,
+                durationSec = 0.0,
+                canUndo = false,
+                canRedo = false,
+                renderQueue = emptyList()
+            )
+        }
+    }
+
+    /** Export settings whose aspect, resolution and frame rate match a project's canvas. */
+    private fun exportSettingsFor(settings: ProjectSettings, base: ExportSettings): ExportSettings {
+        val w = settings.width
+        val h = settings.height
+        val aspect = when {
+            w == h -> "square"
+            h > w -> "portrait"
+            abs(w * 3.0 / 4.0 - h) < 2.0 -> "classic"
+            else -> "landscape"
+        }
+        val longSide = when (aspect) {
+            "square" -> w * 16 / 9
+            "portrait" -> h
+            else -> w
+        }
+        val resolution = when {
+            longSide >= 1900 -> "1920x1080"
+            longSide <= 900 -> "854x480"
+            else -> "1280x720"
+        }
+        return base.copy(aspect = aspect, resolution = resolution, fps = settings.fps, rangeInSec = null, rangeOutSec = null)
+    }
+
+    /**
+     * Creates a new stored project and opens it. The project being edited is saved first, so
+     * nothing is discarded.
+     */
+    fun createProject(name: String, settings: ProjectSettings = ProjectSettings(), announce: Boolean = true): Boolean {
+        closeCurrentProject()
+        val created = runCatching { projectStore.create(name.trim().ifEmpty { "Untitled Project" }, settings) }.getOrNull()
+        if (created == null) {
+            showAlert("COULD NOT CREATE PROJECT", "The project folder could not be written. Check the device has free storage.")
+            return false
+        }
+        resetEditor(created.name, settings, created.id)
+        savedContent = contentOf(_uiState.value)
+        prefs.edit().putString("last_project_id", created.id).apply()
+        _uiState.update { it.copy(showHome = false, showNewProjectModal = false, saveStatus = "New project created") }
+        refreshProjects()
+        if (announce) showToast("Created \"${created.name}\"")
+        return true
+    }
+
     fun startNewProject() {
-        snapHistory()
+        createProject("Untitled Project")
+    }
+
+    /** Opens a stored project in the editor. */
+    fun openProject(id: String) {
+        if (id == _uiState.value.currentProjectId) {
+            _uiState.update { it.copy(showHome = false) }
+            return
+        }
+        closeCurrentProject()
+        val raw = projectStore.load(id)
+        val doc = raw?.let { runCatching { ProjectSerializer.deserializeProject(it) }.getOrNull() }
+        if (doc == null) {
+            refreshProjects()
+            showAlert("COULD NOT OPEN PROJECT", "This project's file is missing or damaged.")
+            return
+        }
+        resetEditor(doc.name, doc.settings, id)
+        // Media removed from the library in an earlier session is deleted now, when no undo
+        // step can still bring it back.
+        runCatching {
+            projectStore.pruneMedia(id, doc.assets.flatMap { listOfNotNull(it.localPath) + it.filmstripPaths }.toSet())
+        }
+        val dur = TimelineEngine.calcProjectDuration(doc.clips, doc.assets.associateBy { it.id })
         _uiState.update {
             it.copy(
                 showHome = false,
-                projectName = "Untitled Project",
-                clips = emptyList(),
-                markers = emptyList(),
-                selectedClipId = null,
-                selectedClipIds = emptySet(),
-                playheadSec = 0.0,
-                durationSec = 0.0,
-                saveStatus = "New project created"
+                assets = doc.assets,
+                clips = doc.clips,
+                markers = doc.markers,
+                trackStates = TimelineTrack.entries.associateWith { t -> doc.trackStates[t] ?: TrackState() },
+                durationSec = dur,
+                selectedClipId = doc.clips.firstOrNull()?.id,
+                selectedClipIds = setOfNotNull(doc.clips.firstOrNull()?.id),
+                saveStatus = "Opened · ${doc.name}"
             )
         }
-        scheduleAutosave()
-        showToast("New project created. Your imported media remains in the library.")
+        // What is now in the editor is exactly what is on disk.
+        savedContent = contentOf(_uiState.value)
+        prefs.edit().putString("last_project_id", id).apply()
     }
 
+    /** Stops playback and writes the open project's pending changes. */
+    private fun closeCurrentProject() {
+        pausePlayback()
+        flushSave()
+    }
+
+    /** Leaves the editor for the project list. */
+    fun goHome() {
+        closeCurrentProject()
+        refreshProjects()
+        _uiState.update { it.copy(showHome = true) }
+    }
+
+    fun renameProject(id: String, name: String) {
+        val clean = name.trim()
+        if (clean.isEmpty()) return
+        if (id == _uiState.value.currentProjectId) {
+            setProjectName(clean)
+            flushSave()
+        } else if (!projectStore.rename(id, clean)) {
+            showToast("Could not rename that project.")
+        }
+        refreshProjects()
+    }
+
+    fun duplicateProject(id: String) {
+        if (id == _uiState.value.currentProjectId) flushSave()
+        viewModelScope.launch {
+            // Copying media can take a while for a large project.
+            val copy = withContext(Dispatchers.IO) { projectStore.duplicate(id) }
+            refreshProjects()
+            showToast(if (copy != null) "Duplicated as \"${copy.name}\"" else "Could not duplicate that project.")
+        }
+    }
+
+    fun requestDeleteProject(id: String) {
+        val project = _uiState.value.projects.find { it.id == id } ?: return
+        _uiState.update { it.copy(pendingConfirm = PendingConfirm.DeleteProject(id, project.name)) }
+    }
+
+    /** Deletes a stored project together with the media imported into it. */
+    fun deleteProject(id: String) {
+        if (id == _uiState.value.currentProjectId) {
+            autosaveJob?.cancel()
+            autosaveJob = null
+            resetEditor("Untitled Project", ProjectSettings(), null)
+            _uiState.update { it.copy(showHome = true) }
+        }
+        val ok = projectStore.delete(id)
+        if (prefs.getString("last_project_id", null) == id) prefs.edit().remove("last_project_id").apply()
+        refreshProjects()
+        showToast(if (ok) "Project deleted" else "Could not delete that project.")
+    }
+
+    fun setShowNewProjectModal(show: Boolean) = _uiState.update { it.copy(showNewProjectModal = show) }
+
+    /** The project as a portable `.filmcraft` document, for "Export project file". */
     fun exportProjectJson(): String {
         val s = _uiState.value
         return ProjectSerializer.serializeProject(
@@ -1673,34 +2743,26 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             settings = s.projectSettings,
             clips = s.clips,
             markers = s.markers,
-            assets = s.assets
+            assets = s.assets,
+            trackStates = s.trackStates
         )
     }
 
+    /**
+     * Imports a `.filmcraft` file as a new project and opens it. Media the file refers to that
+     * is still on this device is copied into the new project.
+     */
     fun openProjectJson(rawJson: String) {
-        try {
-            val doc = ProjectSerializer.deserializeProject(rawJson)
-            snapHistory()
-            val mergedAssets = (_uiState.value.assets + doc.assets).distinctBy { it.id }
-            val dur = TimelineEngine.calcProjectDuration(doc.clips, mergedAssets.associateBy { it.id })
-            _uiState.update {
-                it.copy(
-                    showHome = false,
-                    projectName = doc.name,
-                    projectSettings = doc.settings,
-                    assets = mergedAssets,
-                    clips = doc.clips,
-                    markers = doc.markers,
-                    durationSec = dur,
-                    playheadSec = 0.0,
-                    selectedClipId = doc.clips.firstOrNull()?.id,
-                    selectedClipIds = doc.clips.firstOrNull()?.let { c -> setOf(c.id) } ?: emptySet(),
-                    saveStatus = "Project opened · ${doc.name}"
-                )
+        closeCurrentProject()
+        viewModelScope.launch {
+            val created = withContext(Dispatchers.IO) { projectStore.importDocument(rawJson) }
+            if (created == null) {
+                showToast("Could not open project: the file is not a valid EditPro project.")
+                return@launch
             }
-            showToast("Project opened: ${doc.name}")
-        } catch (e: Exception) {
-            showToast("Could not open project: ${e.message}")
+            refreshProjects()
+            openProject(created.id)
+            showToast("Project imported: ${created.name}")
         }
     }
 
@@ -1718,7 +2780,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         if (c.keyframes.isEmpty()) { showToast("Add keyframes first"); return }
         val clean = name.trim()
         if (clean.isEmpty()) return
-        val dur = max(0.1, TimelineEngine.sourceSpanDuration(c, s.assetsById))
+        val dur = max(0.1, TimelineEngine.clipDuration(c, s.assetsById))
         val baseScale = c.scale / 100.0
         val steps = c.keyframes.map { k ->
             MotionKeyframeStep(
@@ -1841,7 +2903,18 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
     // EXPORT & RENDER QUEUE
     // -------------------------------------------------------------------------
     fun updateExportSettings(transform: (ExportSettings) -> ExportSettings) {
-        _uiState.update { it.copy(exportSettings = transform(it.exportSettings)) }
+        _uiState.update { st ->
+            val next = transform(st.exportSettings)
+            // The preview stage follows the export frame, so what is framed is what is rendered.
+            val (w, h) = next.copy(androidLowRamGuard = false).resolvedDimensions()
+            st.copy(exportSettings = next, projectSettings = ProjectSettings(w, h, next.fps))
+        }
+        scheduleAutosave()
+    }
+
+    fun clearExportRange() {
+        _uiState.update { it.copy(exportSettings = it.exportSettings.copy(rangeInSec = null, rangeOutSec = null)) }
+        showToast("Export range cleared: the whole timeline will be rendered")
     }
 
     fun setExportRangePointAtPlayhead(isInPoint: Boolean) {
@@ -1942,6 +3015,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                 val s = _uiState.value
                 var succeeded = 0
                 var failed = 0
+                var soundTrouble = 0
                 var lastPath: String? = null
                 for ((index, job) in queue.withIndex()) {
                     val result = NativeVideoExporter.exportProjectToMp4(
@@ -1962,6 +3036,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                     )
                     if (result.success) {
                         succeeded++
+                        if (result.soundNote != null) soundTrouble++
                         lastPath = result.outputFile?.absolutePath
                         result.outputFile?.let { f ->
                             withContext(Dispatchers.IO) {
@@ -1972,7 +3047,8 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                         failed++
                     }
                 }
-                val summary = "Render queue finished: $succeeded succeeded, $failed failed."
+                val summary = "Render queue finished: $succeeded succeeded, $failed failed." +
+                    if (soundTrouble > 0) " Sound is missing or incomplete in $soundTrouble of them." else ""
                 _uiState.update {
                     it.copy(
                         isExporting = false,
@@ -2016,90 +3092,30 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
 
     // -------------------------------------------------------------------------
     // DESTRUCTIVE-ACTION GUARD
-    // New / Open / Load-demo all replace the timeline, so they ask first whenever
-    // there is real work on it. The choice is held as an enum (never a lambda) so
-    // it survives recomposition cleanly.
+    // Deleting a project or removing media asks first. The request is held as data (never a
+    // lambda) so it survives recomposition cleanly.
     // -------------------------------------------------------------------------
-    fun hasWorkToDiscard(): Boolean =
-        _uiState.value.clips.isNotEmpty() || _uiState.value.markers.isNotEmpty()
-
-    fun requestConfirm(action: PendingConfirm) {
-        _uiState.update { it.copy(pendingConfirm = action) }
-    }
-
     fun clearConfirm() {
         _uiState.update { it.copy(pendingConfirm = null) }
     }
 
+    fun confirmPending() {
+        val action = _uiState.value.pendingConfirm ?: return
+        clearConfirm()
+        when (action) {
+            is PendingConfirm.DeleteProject -> deleteProject(action.id)
+            is PendingConfirm.DeleteAssets -> deleteAssets(action.ids)
+            PendingConfirm.ResetShortcuts -> resetAllShortcuts()
+        }
+    }
+
     override fun onCleared() {
+        // Last chance to persist: the debounced autosave is cancelled with the scope.
+        runCatching { flushSave() }
         previewAudio.stop()
         mcpServer?.stop()
         mcpServer = null
         super.onCleared()
-    }
-
-    // -------------------------------------------------------------------------
-    // PROJECT HOME & RECENT PROJECTS
-    // -------------------------------------------------------------------------
-    fun setShowHome(show: Boolean) {
-        _uiState.update { it.copy(showHome = show) }
-    }
-
-    /** Called after a project has been written successfully through the file picker. */
-    fun recordRecentProject() {
-        val s = _uiState.value
-        val entry = RecentProject(
-            name = s.projectName,
-            savedAtEpochMs = System.currentTimeMillis(),
-            clipCount = s.clips.size,
-            durationSec = s.durationSec
-        )
-        val next = (listOf(entry) + s.recentProjects.filter { it.name != entry.name }).take(12)
-        _uiState.update { it.copy(recentProjects = next) }
-        persistRecentProjects(next)
-    }
-
-    /** Removes only the list entry; the saved project file is left untouched. */
-    fun removeRecentProject(name: String) {
-        val next = _uiState.value.recentProjects.filterNot { it.name == name }
-        _uiState.update { it.copy(recentProjects = next) }
-        persistRecentProjects(next)
-        showToast("Removed \"$name\" from the recent list. The saved file is unchanged.")
-    }
-
-    private fun loadRecentProjects() {
-        val raw = prefs.getString("recent_projects", null) ?: return
-        try {
-            val arr = org.json.JSONArray(raw)
-            val list = (0 until arr.length()).mapNotNull { i ->
-                arr.optJSONObject(i)?.let { o ->
-                    RecentProject(
-                        name = o.optString("name", "Project"),
-                        savedAtEpochMs = o.optLong("savedAt", 0L),
-                        clipCount = o.optInt("clips", 0),
-                        durationSec = o.optDouble("duration", 0.0)
-                    )
-                }
-            }
-            _uiState.update { it.copy(recentProjects = list) }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun persistRecentProjects(list: List<RecentProject>) {
-        try {
-            val arr = org.json.JSONArray()
-            list.forEach { rp ->
-                arr.put(org.json.JSONObject().apply {
-                    put("name", rp.name)
-                    put("savedAt", rp.savedAtEpochMs)
-                    put("clips", rp.clipCount)
-                    put("duration", rp.durationSec)
-                })
-            }
-            prefs.edit().putString("recent_projects", arr.toString()).apply()
-        } catch (_: Exception) {
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -2143,12 +3159,16 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
 
     private fun loadClipMenu() {
         val raw = prefs.getString("clip_menu_order", null) ?: return
-        val ids = raw.split(",").map { it.trim() }.filter { ClipMenuAction.fromId(it) != null }
+        var ids = raw.split(",").map { it.trim() }.filter { ClipMenuAction.fromId(it) != null }
+        if (prefs.getInt("clip_menu_version", 1) < 3) {
+            ids = ClipMenuAction.upgradeSavedOrder(ids)
+            prefs.edit().putInt("clip_menu_version", 3).putString("clip_menu_order", ids.joinToString(",")).apply()
+        }
         _uiState.update { it.copy(clipMenuOrder = ids) }
     }
 
     private fun persistClipMenu(order: List<String>) {
-        prefs.edit().putString("clip_menu_order", order.joinToString(",")).apply()
+        prefs.edit().putString("clip_menu_order", order.joinToString(",")).putInt("clip_menu_version", 3).apply()
     }
 
     private companion object {
@@ -2320,7 +3340,8 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
         muted: Boolean?,
         hidden: Boolean?,
         solo: Boolean?,
-        locked: Boolean?
+        locked: Boolean?,
+        collapsed: Boolean? = null
     ): Boolean {
         val track = TimelineTrack.entries.find { it.key == trackKey } ?: return false
         _uiState.update { st ->
@@ -2330,10 +3351,13 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                     muted = muted ?: current.muted,
                     hidden = hidden ?: current.hidden,
                     solo = solo ?: current.solo,
-                    locked = locked ?: current.locked
+                    locked = locked ?: current.locked,
+                    collapsed = collapsed ?: current.collapsed
                 ))
             )
         }
+        // Track states are part of the project file.
+        scheduleAutosave()
         return true
     }
 
@@ -2478,13 +3502,310 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
 
     /** Adds an asset produced by a web fetch to the library, ready for add_clip. */
     fun mcpAddFetchedAsset(asset: MediaAsset) {
+        val owned = ensureProjectId(force = true)?.let { projectStore.adoptAsset(it, asset) } ?: asset
+        snapHistory()
         _uiState.update { st ->
             st.copy(
-                assets = st.assets + asset,
-                selectedAssetId = asset.id,
-                saveStatus = "Fetched ${asset.name}"
+                assets = st.assets + owned,
+                selectedAssetId = owned.id,
+                selectedAssetIds = setOf(owned.id),
+                saveStatus = "Fetched ${owned.name}"
             )
         }
         scheduleAutosave()
+    }
+
+    /** Adds a motion graphic for the assistant; returns the new clip id. */
+    fun mcpAddGraphic(templateId: String, startSec: Double?, durationSec: Double?, text: String?): String? {
+        val before = _uiState.value.clips.map { it.id }.toSet()
+        if (startSec != null) seekTo(startSec)
+        addMotionGraphic(templateId)
+        val created = _uiState.value.clips.lastOrNull { it.id !in before } ?: return null
+        if (durationSec != null || text != null) {
+            _uiState.update { st ->
+                st.copy(clips = st.clips.map {
+                    if (it.id == created.id) {
+                        it.copy(trimOut = durationSec?.coerceIn(0.2, 600.0) ?: it.trimOut, text = text ?: it.text)
+                    } else it
+                })
+            }
+            recalcAndSync()
+        }
+        return created.id
+    }
+
+    /** Runs one of the multi-clip timeline edits on [clipIds] for the assistant. */
+    fun mcpEditClips(clipIds: Set<String>, operation: String, atSec: Double?): Boolean {
+        val known = _uiState.value.clips.map { it.id }.toSet()
+        val ids = clipIds.filter { it in known }.toSet()
+        if (ids.isEmpty() && operation != "paste" && operation != "close_gaps") return false
+        if (ids.isNotEmpty()) selectClipsByIds(ids)
+        if (atSec != null) seekTo(atSec)
+        when (operation) {
+            "ripple_delete" -> rippleDeleteSelectedClip()
+            "duplicate" -> duplicateSelectedClips()
+            "copy" -> copySelectedClips()
+            "cut" -> cutSelectedClips()
+            "paste" -> pasteClips()
+            "close_gaps" -> closeGaps()
+            "detach_audio" -> detachAudioFromSelection()
+            "trim_start" -> trimToPlayhead(keepTail = true, ripple = false)
+            "trim_end" -> trimToPlayhead(keepTail = false, ripple = false)
+            "ripple_trim_start" -> trimToPlayhead(keepTail = true, ripple = true)
+            "ripple_trim_end" -> trimToPlayhead(keepTail = false, ripple = true)
+            else -> return false
+        }
+        return true
+    }
+
+    /** Moves clips together by [deltaSec] for the assistant; returns the distance actually moved. */
+    fun mcpMoveClips(clipIds: Set<String>, deltaSec: Double): Double {
+        val known = _uiState.value.clips.map { it.id }.toSet()
+        val ids = clipIds.filter { it in known }.toSet()
+        if (ids.isEmpty()) return 0.0
+        snapHistory()
+        return moveSelectionBy(deltaSec, ids)
+    }
+
+    /** Sets or edits a keyframe on a clip for the assistant; [timeSec] is on the timeline. */
+    fun mcpSetKeyframe(clipId: String, timeSec: Double, patch: KeyframePatch): Boolean {
+        val s = _uiState.value
+        val rc = s.resolvedClips.find { it.clip.id == clipId } ?: return false
+        val localT = (timeSec - rc.start).coerceIn(0.0, rc.duration)
+        snapHistory()
+        replaceClip(KeyframeOps.upsert(rc.clip, localT, patch), "Keyframe set")
+        return true
+    }
+
+    fun mcpRemoveKeyframe(clipId: String, timeSec: Double): Boolean {
+        val s = _uiState.value
+        val rc = s.resolvedClips.find { it.clip.id == clipId } ?: return false
+        val index = KeyframeOps.indexAt(rc.clip, (timeSec - rc.start).coerceIn(0.0, rc.duration))
+        if (index < 0) return false
+        snapHistory()
+        replaceClip(KeyframeOps.remove(rc.clip, index), "Keyframe removed")
+        return true
+    }
+
+    // -------------------------------------------------------------------------
+    // MOTION GRAPHICS
+    // -------------------------------------------------------------------------
+    fun setShowGraphicsModal(show: Boolean) = _uiState.update { it.copy(showGraphicsModal = show) }
+
+    /**
+     * Adds a motion-graphics clip at the playhead (or across the whole edit, for templates such
+     * as bars and progress). It uses the template's track when that is free, else the other
+     * title track, else the first free position after the playhead.
+     */
+    fun addMotionGraphic(templateId: String) {
+        val template: MgTemplate = MotionGraphics.find(templateId) ?: run {
+            showToast("Unknown motion graphic.")
+            return
+        }
+        val s = _uiState.value
+        val draft = MotionGraphics.createClip(template, s.playheadSec, s.durationSec)
+        val dur = TimelineEngine.clipDuration(draft, s.assetsById)
+        val candidates = (listOf(template.track) + TimelineTrack.entries.filter { it.isTitle && it != template.track })
+            .filter { s.trackStates[it]?.locked != true }
+        if (candidates.isEmpty()) {
+            showToast("The graphics and text tracks are locked.")
+            return
+        }
+        val free = candidates.firstOrNull { t ->
+            s.resolvedClips.none { it.clip.track == t && it.start < draft.startAt + dur - 0.001 && it.end > draft.startAt + 0.001 }
+        }
+        val track = free ?: candidates.first()
+        val start = if (free != null) draft.startAt else TimelineEngine.resolveTimelineStart(
+            desired = draft.startAt, duration = dur, track = track, clipId = draft.id,
+            scalePxPerSec = 0.0, direction = 1.0, allClips = s.clips, assetsById = s.assetsById,
+            playhead = s.playheadSec, magneticSnap = false
+        )
+        val clip = draft.copy(track = track, startAt = start)
+        snapHistory()
+        _uiState.update {
+            it.copy(
+                clips = it.clips + clip,
+                selectedClipId = clip.id,
+                selectedClipIds = setOf(clip.id),
+                activeInspectorTab = InspectorTab.CLIP,
+                showGraphicsModal = false
+            )
+        }
+        recalcAndSync("Motion graphic added")
+        showToast("Added ${template.title} to ${track.label}")
+    }
+
+    // -------------------------------------------------------------------------
+    // PANELS
+    // -------------------------------------------------------------------------
+    fun togglePanel(panel: WorkspacePanel) {
+        _uiState.update {
+            when (panel) {
+                WorkspacePanel.LIBRARY -> it.copy(libraryCollapsed = !it.libraryCollapsed, previewMaximized = false)
+                WorkspacePanel.INSPECTOR -> it.copy(inspectorCollapsed = !it.inspectorCollapsed, previewMaximized = false)
+                WorkspacePanel.TIMELINE -> it.copy(timelineCollapsed = !it.timelineCollapsed, previewMaximized = false)
+            }
+        }
+        val s = _uiState.value
+        prefs.edit()
+            .putBoolean("panel_library_collapsed", s.libraryCollapsed)
+            .putBoolean("panel_inspector_collapsed", s.inspectorCollapsed)
+            .putBoolean("panel_timeline_collapsed", s.timelineCollapsed)
+            .apply()
+    }
+
+    /** Hides every panel so the preview fills the window; the panels' own state is kept. */
+    fun toggleMaximizePreview() {
+        _uiState.update { it.copy(previewMaximized = !it.previewMaximized) }
+    }
+
+    // -------------------------------------------------------------------------
+    // KEYBOARD SHORTCUTS
+    // -------------------------------------------------------------------------
+    private fun loadShortcutBindings() {
+        val raw = prefs.getString("shortcut_overrides", null) ?: return
+        runCatching {
+            val obj = JSONObject(raw)
+            val map = obj.keys().asSequence().associateWith { obj.optString(it, "") }
+            _uiState.update { it.copy(bindings = ShortcutBindings(map)) }
+        }
+    }
+
+    private fun applyBindings(bindings: ShortcutBindings) {
+        val obj = JSONObject()
+        bindings.overrides.forEach { (id, chord) -> obj.put(id, chord) }
+        prefs.edit().putString("shortcut_overrides", obj.toString()).apply()
+        _uiState.update { it.copy(bindings = bindings) }
+    }
+
+    /** Binds [chord] to [action]; an empty chord leaves the action without a key. */
+    fun rebindShortcut(action: EditorShortcut, chord: String) {
+        val current = _uiState.value.bindings
+        val displaced = if (chord.isEmpty()) null else current.resolve(chord)?.takeIf { it != action }
+        val next = current.rebind(action, chord)
+        applyBindings(next)
+        showToast(
+            when {
+                chord.isEmpty() -> "\"${action.label}\" has no shortcut now"
+                displaced != null -> "${next.display(action)} now runs \"${action.label}\" instead of \"${displaced.label}\""
+                else -> "\"${action.label}\" is now ${next.display(action)}"
+            }
+        )
+    }
+
+    fun resetShortcut(action: EditorShortcut) {
+        applyBindings(_uiState.value.bindings.reset(action))
+    }
+
+    fun requestResetShortcuts() {
+        _uiState.update { it.copy(pendingConfirm = PendingConfirm.ResetShortcuts) }
+    }
+
+    fun resetAllShortcuts() {
+        applyBindings(ShortcutBindings())
+        showToast("Keyboard shortcuts reset to defaults")
+    }
+
+    /**
+     * Runs a keyboard action. Returns false for the few actions only the screen can perform
+     * (the system file pickers and full screen), which the caller handles itself.
+     */
+    fun performShortcut(action: EditorShortcut): Boolean {
+        val s = _uiState.value
+        when (action) {
+            EditorShortcut.PLAY_PAUSE -> togglePlayPause()
+            EditorShortcut.SHUTTLE_BACK -> shuttle(-1)
+            EditorShortcut.SHUTTLE_STOP -> shuttle(0)
+            EditorShortcut.SHUTTLE_FORWARD -> shuttle(1)
+            EditorShortcut.STEP_BACK -> stepFrames(-1)
+            EditorShortcut.STEP_FORWARD -> stepFrames(1)
+            EditorShortcut.JUMP_BACK -> seekTo(s.playheadSec - 1.0)
+            EditorShortcut.JUMP_FORWARD -> seekTo(s.playheadSec + 1.0)
+            EditorShortcut.GO_START -> seekTo(0.0)
+            EditorShortcut.GO_END -> seekTo(s.durationSec)
+            EditorShortcut.PREV_EDIT -> jumpToEditPoint(-1)
+            EditorShortcut.NEXT_EDIT -> jumpToEditPoint(1)
+
+            EditorShortcut.SPLIT -> splitAtPlayhead()
+            EditorShortcut.SPLIT_ALL -> splitAtPlayhead(allTracks = true)
+            EditorShortcut.DELETE -> deleteSelectedClips()
+            EditorShortcut.RIPPLE_DELETE -> rippleDeleteSelectedClip()
+            EditorShortcut.RIPPLE_TRIM_START -> trimToPlayhead(keepTail = true, ripple = true)
+            EditorShortcut.RIPPLE_TRIM_END -> trimToPlayhead(keepTail = false, ripple = true)
+            EditorShortcut.TRIM_START -> trimToPlayhead(keepTail = true, ripple = false)
+            EditorShortcut.TRIM_END -> trimToPlayhead(keepTail = false, ripple = false)
+            EditorShortcut.NUDGE_LEFT -> nudgeSelectionFrames(-1)
+            EditorShortcut.NUDGE_RIGHT -> nudgeSelectionFrames(1)
+            EditorShortcut.NUDGE_LEFT_BIG -> nudgeSelectionFrames(-10)
+            EditorShortcut.NUDGE_RIGHT_BIG -> nudgeSelectionFrames(10)
+            EditorShortcut.DUPLICATE -> duplicateSelectedClips()
+            EditorShortcut.CLOSE_GAPS -> closeGaps()
+            EditorShortcut.DETACH_AUDIO -> detachAudioFromSelection()
+            EditorShortcut.ADD_TEXT -> addBlankTextClip()
+            EditorShortcut.ADD_GRAPHIC -> setShowGraphicsModal(true)
+            EditorShortcut.UNDO -> undo()
+            EditorShortcut.REDO -> redo()
+
+            EditorShortcut.COPY -> copySelectedClips()
+            EditorShortcut.CUT -> cutSelectedClips()
+            EditorShortcut.PASTE -> pasteClips()
+            EditorShortcut.COPY_ATTRS -> copySelectedClipAttributes()
+            EditorShortcut.PASTE_ATTRS -> pasteClipAttributesToSelected()
+            EditorShortcut.SELECT_ALL -> selectAllClips()
+            EditorShortcut.SELECT_FORWARD -> selectClipsFromPlayhead()
+            EditorShortcut.DESELECT -> {
+                _uiState.update { it.copy(selectedClipId = null, selectedClipIds = emptySet(), selectionMode = false, selectedAssetIds = emptySet()) }
+            }
+            EditorShortcut.SELECT_PREV -> selectAdjacentClip(-1)
+            EditorShortcut.SELECT_NEXT -> selectAdjacentClip(1)
+            EditorShortcut.SELECTION_MODE -> toggleSelectionMode()
+
+            EditorShortcut.ADD_KEYFRAME -> addOrUpdateKeyframeAtPlayhead()
+            EditorShortcut.DELETE_KEYFRAME -> removeKeyframeAtPlayhead()
+            EditorShortcut.PREV_KEYFRAME -> jumpToKeyframe(-1)
+            EditorShortcut.NEXT_KEYFRAME -> jumpToKeyframe(1)
+            EditorShortcut.KEYFRAME_LANE -> toggleKeyframeLane()
+            EditorShortcut.ADD_MARKER -> addMarkerAtPlayhead()
+            EditorShortcut.NEXT_MARKER -> jumpToMarker(1)
+            EditorShortcut.PREV_MARKER -> jumpToMarker(-1)
+            EditorShortcut.MARK_IN -> setExportRangePointAtPlayhead(true)
+            EditorShortcut.MARK_OUT -> setExportRangePointAtPlayhead(false)
+            EditorShortcut.CLEAR_RANGE -> clearExportRange()
+
+            EditorShortcut.ZOOM_IN -> zoomTimelineBy(1.25)
+            EditorShortcut.ZOOM_OUT -> zoomTimelineBy(1.0 / 1.25)
+            EditorShortcut.ZOOM_FIT -> if (!s.timelineAutoFit) toggleAutoFitTimeline()
+            EditorShortcut.TOGGLE_SNAP -> toggleMagneticSnap()
+            EditorShortcut.TOGGLE_FOLLOW -> toggleFollowPlayhead()
+            EditorShortcut.TOGGLE_SCRUB -> toggleScrubFollow()
+            EditorShortcut.COLLAPSE_TRACKS -> toggleAllTracksCollapsed()
+
+            EditorShortcut.TOGGLE_LIBRARY -> togglePanel(WorkspacePanel.LIBRARY)
+            EditorShortcut.TOGGLE_INSPECTOR -> togglePanel(WorkspacePanel.INSPECTOR)
+            EditorShortcut.TOGGLE_TIMELINE -> togglePanel(WorkspacePanel.TIMELINE)
+            EditorShortcut.MAXIMIZE_PREVIEW -> toggleMaximizePreview()
+            EditorShortcut.FULLSCREEN -> return false
+
+            EditorShortcut.NEW_PROJECT -> setShowNewProjectModal(true)
+            EditorShortcut.OPEN_PROJECT_FILE -> return false
+            EditorShortcut.SAVE -> saveProjectNow()
+            EditorShortcut.EXPORT_PROJECT_FILE -> return false
+            EditorShortcut.IMPORT_MEDIA -> return false
+            EditorShortcut.EXPORT_VIDEO -> setShowExportModal(true)
+            EditorShortcut.HOME -> goHome()
+
+            EditorShortcut.TOOLS -> setShowToolsModal(true)
+            EditorShortcut.PRESETS -> setShowPresetsModal(true)
+            EditorShortcut.SHORTCUTS -> setShowShortcutsModal(true)
+            EditorShortcut.ASSISTANT -> setShowAgentChat(true)
+            EditorShortcut.MODE_EDIT -> setWorkspaceMode(WorkspaceMode.EDIT)
+            EditorShortcut.MODE_COLOR -> setWorkspaceMode(WorkspaceMode.COLOR)
+            EditorShortcut.MODE_MOTION -> setWorkspaceMode(WorkspaceMode.MOTION)
+            EditorShortcut.MODE_MUSIC -> setWorkspaceMode(WorkspaceMode.MUSIC)
+            EditorShortcut.TOGGLE_SCOPES -> toggleScopesPinned()
+            EditorShortcut.GRADE_SPLIT -> toggleGradeSplitWipe()
+            EditorShortcut.TOGGLE_THEME -> toggleLightTheme()
+        }
+        return true
     }
 }

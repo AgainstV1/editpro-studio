@@ -2,7 +2,7 @@ package com.editpro.studio.media
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.graphics.BitmapShader
 import android.graphics.Camera
 import android.graphics.Canvas
 import android.graphics.Color
@@ -14,11 +14,11 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
-import android.graphics.Typeface
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
+import android.os.Build
 import android.media.MediaMuxer
 import com.editpro.studio.model.AssetKind
 import com.editpro.studio.model.ExportSettings
@@ -40,19 +40,30 @@ import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
+/**
+ * Supplies decoded video frames to the compositor. The preview uses one so it can keep and
+ * reuse the frame it already has; the caller owns the bitmap it returns.
+ */
+fun interface VideoFrameSource {
+    fun frameAt(clip: TimelineClip, asset: MediaAsset, timeUs: Long): Bitmap?
+}
+
 data class ExportResult(
     val success: Boolean,
     val outputFile: File? = null,
-    val message: String
+    val message: String,
+    /** Set when the file was written but some or all of its sound is missing; says what. */
+    val soundNote: String? = null
 )
 
 object NativeVideoExporter {
 
     /**
-     * Renders the multi-track EditPro timeline to an H.264 MP4 file using Android's native
-     * hardware `MediaCodec` + `MediaMuxer` pipeline, compositing all visual layers (VIDEO 1,
-     * VIDEO 2, OVERLAY, TEXT & TITLES), keyframe animations, 3-Way Color Wheels, 3D Camera Rigs,
-     * transitions, vignette, and film grain.
+     * Renders the timeline to an H.264 MP4 with Android's own `MediaCodec` + `MediaMuxer`.
+     * Every frame comes from [renderCompositeFrame] — the same compositor the preview uses — so
+     * the picture layers, keyframe animation, grade, camera rig, fades, vignette, motion graphics
+     * and titles match what was on screen while editing. The audio track is mixed by
+     * [TimelineAudioEncoder].
      */
     suspend fun exportProjectToMp4(
         context: Context,
@@ -72,12 +83,12 @@ object NativeVideoExporter {
                 assetsById.containsKey(rc.clip.assetId)
         }
         val visibleTexts = started.filter { rc ->
-            rc.clip.track == TimelineTrack.TEXT && trackStates[rc.clip.track]?.hidden != true
+            rc.clip.track.isTitle && trackStates[rc.clip.track]?.hidden != true
         }
         if (visibleVisuals.isEmpty() && visibleTexts.isEmpty()) {
             return@withContext ExportResult(
                 success = false,
-                message = "Add at least one visible video, image, or text clip before exporting."
+                message = "Add at least one visible video, image, text or graphics clip before exporting."
             )
         }
 
@@ -97,7 +108,13 @@ object NativeVideoExporter {
         val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
         val safeTitle = projectName.replace(Regex("[^a-zA-Z0-9_-]+"), "_").take(50).ifEmpty { "EditPro_Project" }
         val outputFile = File(exportDir, "${safeTitle}_AndroidTurbo.mp4")
-        if (outputFile.exists()) outputFile.delete()
+        // The render is written beside its final name and moved there only once it is whole, so
+        // a cancelled or failed render neither leaves a file no player can open nor costs the
+        // previous render of the same project. Anything a killed render left behind goes first.
+        val partFile = File(exportDir, "${outputFile.name}.part")
+        runCatching {
+            exportDir.listFiles { f -> f.isFile && f.name.endsWith(".part") }?.forEach { it.delete() }
+        }
 
         onProgress(2, "Initializing Android Hardware H.264 encoder (${width}×${height} @ ${fps}fps)…")
 
@@ -105,12 +122,38 @@ object NativeVideoExporter {
         val bitmapCache = mutableMapOf<String, Bitmap>()
         val videoRetrievers = mutableMapOf<String, MediaMetadataRetriever>()
 
+        // Whatever the render opens is noted here and closed by closeRender(), on the way out
+        // as much as at the end: a cancelled or failed render must not keep a hardware encoder,
+        // an open file and a frame-sized bitmap until the garbage collector happens by.
+        var openEncoder: MediaCodec? = null
+        var openMuxer: MediaMuxer? = null
+        var openFrame: Bitmap? = null
+        var completed = false
+
+        fun closeRender() {
+            openFrame?.let { if (!it.isRecycled) it.recycle() }
+            openFrame = null
+            openEncoder?.let { codec ->
+                try { codec.stop() } catch (_: Exception) {}
+                try { codec.release() } catch (_: Exception) {}
+            }
+            openEncoder = null
+            openMuxer?.let { writer ->
+                // Only reached with the muxer still running when the render is being given
+                // up, so it does not matter whether stop() manages to finish the file.
+                try { writer.stop() } catch (_: Exception) {}
+                try { writer.release() } catch (_: Exception) {}
+            }
+            openMuxer = null
+        }
+
         try {
             for (rc in visibleVisuals) {
                 val asset = assetsById[rc.clip.assetId] ?: continue
                 val path = asset.localPath ?: continue
                 if (asset.kind == AssetKind.IMAGE && !bitmapCache.containsKey(asset.id)) {
-                    BitmapFactory.decodeFile(path)?.let { bitmapCache[asset.id] = it }
+                    // Twice the frame leaves room to zoom in without softening the picture.
+                    MediaEngine.decodeStill(path, width * 2, height * 2)?.let { bitmapCache[asset.id] = it }
                 } else if (asset.kind == AssetKind.VIDEO && !videoRetrievers.containsKey(asset.id)) {
                     val ret = MediaMetadataRetriever()
                     try {
@@ -122,14 +165,27 @@ object NativeVideoExporter {
                 }
             }
 
-            // Mix and encode the timeline's audio into an AAC track. Deliberately wrapped: if
-            // anything in the audio path fails, the video must still export (just silent).
-            val encodedAudio = try {
-                TimelineAudioEncoder.encode(started, assetsById, trackStates, fromSec, toSec)
+            // Mix and encode the timeline's sound into an AAC track. Deliberately wrapped: if
+            // anything in the audio path fails the picture must still export, and the result
+            // says that the sound is missing rather than let a silent file look like a success.
+            val audioOutcome = try {
+                TimelineAudioEncoder.encode(started, assetsById, trackStates, fromSec, toSec) { done ->
+                    // A long timeline takes a while to mix, so it reports and can be cancelled.
+                    coroutineContext.ensureActive()
+                    onProgress(2, "Mixing the sound… ${(done * 100f).roundToInt()}%")
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (_: Exception) {
-                null
+                TimelineAudioEncoder.Outcome(null, failed = true)
+            } catch (_: OutOfMemoryError) {
+                TimelineAudioEncoder.Outcome(null, failed = true)
             }
-            if (encodedAudio != null) {
+            val encodedAudio = audioOutcome.audio
+            val audioNote = audioOutcome.note()
+            if (audioNote != null) {
+                onProgress(3, "Sound: $audioNote.")
+            } else if (encodedAudio != null) {
                 onProgress(3, "Audio mixed and encoded (AAC · stereo · 44.1 kHz).")
             }
 
@@ -141,30 +197,37 @@ object NativeVideoExporter {
             }
 
             val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            openEncoder = encoder
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
 
-            val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val muxer = MediaMuxer(partFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            openMuxer = muxer
             var trackIndex = -1
             var audioTrackIndex = -1
             var muxerStarted = false
             val bufferInfo = MediaCodec.BufferInfo()
 
             val frameBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            openFrame = frameBitmap
             val frameCanvas = Canvas(frameBitmap)
             val argbPixels = IntArray(width * height)
             val yuvBuffer = ByteArray(width * height * 3 / 2)
 
             fun drainEncoder(endOfStream: Boolean) {
-                if (endOfStream) {
-                    try {
+                var endQueued = !endOfStream
+                while (true) {
+                    // Waiting for the tail has no fixed length, so it can be cancelled.
+                    if (endOfStream) coroutineContext.ensureActive()
+                    if (!endQueued) {
+                        // If the encoder has no room for the end marker it is offered again
+                        // next time round: without it the tail never comes.
                         val inIdx = encoder.dequeueInputBuffer(10_000L)
                         if (inIdx >= 0) {
                             encoder.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            endQueued = true
                         }
-                    } catch (_: Exception) {}
-                }
-                while (true) {
+                    }
                     val outIdx = encoder.dequeueOutputBuffer(bufferInfo, 10_000L)
                     if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) {
                         if (!endOfStream) break
@@ -243,14 +306,20 @@ object NativeVideoExporter {
             }
 
             drainEncoder(endOfStream = true)
-            frameBitmap.recycle()
-
-            try { encoder.stop() } catch (_: Exception) {}
-            try { encoder.release() } catch (_: Exception) {}
-            if (muxerStarted) {
-                try { muxer.stop() } catch (_: Exception) {}
+            if (!muxerStarted) throw IllegalStateException("the video encoder produced no picture")
+            // Stopping the muxer writes the index that makes the file playable. If that fails
+            // the render has failed, however far it got; a full disk is the usual reason.
+            try {
+                muxer.stop()
+            } catch (e: Exception) {
+                throw IllegalStateException("the file could not be finished (is the device out of space?)", e)
             }
-            try { muxer.release() } catch (_: Exception) {}
+            closeRender()
+            if (!partFile.renameTo(outputFile)) {
+                outputFile.delete()
+                if (!partFile.renameTo(outputFile)) throw IllegalStateException("the finished file could not be saved")
+            }
+            completed = true
 
             // Keep the exports folder bounded — retain only the newest renders.
             runCatching {
@@ -265,7 +334,9 @@ object NativeVideoExporter {
             ExportResult(
                 success = true,
                 outputFile = outputFile,
-                message = "Exported ${outputFile.name} ($sizeKb KB)"
+                message = "Exported ${outputFile.name} ($sizeKb KB)" +
+                    (audioNote?.let { " — $it." } ?: ""),
+                soundNote = audioNote
             )
         } catch (e: kotlinx.coroutines.CancellationException) {
             // Cooperative cancellation must propagate, not be reported as a render failure.
@@ -276,14 +347,20 @@ object NativeVideoExporter {
                 message = "Export failed: ${e.message ?: e.javaClass.simpleName}"
             )
         } finally {
+            closeRender()
+            if (!completed) runCatching { partFile.delete() }
             bitmapCache.values.forEach { it.recycle() }
             videoRetrievers.values.forEach { try { it.release() } catch (_: Exception) {} }
         }
     }
 
     /**
-     * Renders a single composite timeline frame onto any Android `Canvas` (used both for
-     * `captureFrame()` PNG export and `NativeVideoExporter` frame rendering).
+     * Draws one frame of the timeline onto any Android `Canvas`. This is the single compositor:
+     * the exporter calls it for every output frame and the preview ([PreviewCompositor]) calls it
+     * for what is on screen, so the two cannot drift apart.
+     *
+     * Video frames come from [videoFrames] when one is given, otherwise straight from
+     * [videoRetrievers].
      */
     fun renderCompositeFrame(
         canvas: Canvas,
@@ -295,19 +372,22 @@ object NativeVideoExporter {
         trackStates: Map<TimelineTrack, TrackState>,
         bitmapCache: Map<String, Bitmap>,
         videoRetrievers: Map<String, MediaMetadataRetriever>,
-        checkerboard: Boolean = false
+        checkerboard: Boolean = false,
+        videoFrames: VideoFrameSource? = null
     ) {
         val bgPaint = Paint().apply {
             color = if (checkerboard) Color.parseColor("#27272b") else Color.parseColor("#050608")
         }
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
 
+        val projectEnd = allResolved.maxOfOrNull { it.end } ?: 0.0
+        // Layer order is the track order (VIDEO 1 at the bottom, OVERLAY on top), not the order
+        // the clips happen to start in.
         val activeVisuals = allResolved.filter { rc ->
             rc.clip.track.isVisual &&
                 trackStates[rc.clip.track]?.hidden != true &&
-                playheadSec >= rc.start &&
-                playheadSec <= rc.end
-        }
+                TimelineEngine.isActiveAt(rc, playheadSec, projectEnd)
+        }.sortedBy { it.clip.track.ordinal }
 
         var maxVignette = 0.0
         for (rc in activeVisuals) {
@@ -364,6 +444,9 @@ object NativeVideoExporter {
                 }
             }
 
+            // Corner radius is in pixels of a 1280x720 frame, like every other size in a project.
+            val cornerPx = max(0f, c.cornerRadius * min(width / 1280f, height / 720f))
+
             when (asset.kind) {
                 AssetKind.COLOR -> {
                     layerPaint.color = try {
@@ -372,25 +455,47 @@ object NativeVideoExporter {
                         Color.parseColor("#2678ff")
                     }
                     layerPaint.alpha = (finalAlpha * 255).roundToInt().coerceIn(0, 255)
-                    canvas.drawRect(-width / 2f, -height / 2f, width / 2f, height / 2f, layerPaint)
+                    val frame = RectF(-width / 2f, -height / 2f, width / 2f, height / 2f)
+                    if (cornerPx > 0.5f) canvas.drawRoundRect(frame, cornerPx, cornerPx, layerPaint)
+                    else canvas.drawRect(frame, layerPaint)
                 }
                 AssetKind.IMAGE -> {
                     val bmp = bitmapCache[asset.id]
                     if (bmp != null) {
-                        drawContainedBitmap(canvas, bmp, width, height, layerPaint)
+                        drawContainedBitmap(canvas, bmp, width, height, layerPaint, cornerPx)
                     }
                 }
                 AssetKind.VIDEO -> {
                     val ret = videoRetrievers[asset.id]
-                    if (ret != null) {
-                        val targetUs = max(0L, ((c.trimIn + localT * c.speed) * 1_000_000.0).toLong())
+                    val targetUs = max(0L, ((c.trimIn + localT * c.speed) * 1_000_000.0).toLong())
+                    if (videoFrames != null) {
+                        videoFrames.frameAt(c, asset, targetUs)?.let {
+                            drawContainedBitmap(canvas, it, width, height, layerPaint, cornerPx)
+                        }
+                    } else if (ret != null) {
+                        // The exact frame, not the nearest key frame: key frames are often a
+                        // second apart, which turned exported motion into a slideshow. The key
+                        // frame is only a fallback for the odd position a decoder cannot reach.
+                        // Ask for no more pixels than the frame can show (allowing for a clip
+                        // that is zoomed in): a 4K source decoded whole costs 33 MB per frame.
+                        val zoom = max(1.0, anim.scale / 100.0)
+                        val wantW = (width * zoom).roundToInt().coerceAtLeast(2)
+                        val wantH = (height * zoom).roundToInt().coerceAtLeast(2)
                         val vBmp = try {
-                            ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            if (Build.VERSION.SDK_INT >= 27) {
+                                ret.getScaledFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST, wantW, wantH)
+                                    ?: ret.getScaledFrameAtTime(
+                                        targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, wantW, wantH
+                                    )
+                            } else {
+                                ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                    ?: ret.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            }
                         } catch (_: Exception) {
                             null
                         }
                         if (vBmp != null) {
-                            drawContainedBitmap(canvas, vBmp, width, height, layerPaint)
+                            drawContainedBitmap(canvas, vBmp, width, height, layerPaint, cornerPx)
                             vBmp.recycle()
                         }
                     }
@@ -415,81 +520,41 @@ object NativeVideoExporter {
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), vigPaint)
         }
 
-        // Text & Titles track
-        val activeTexts = allResolved.filter { rc ->
-            rc.clip.track == TimelineTrack.TEXT &&
-                trackStates[TimelineTrack.TEXT]?.hidden != true &&
-                playheadSec >= rc.start &&
-                playheadSec <= rc.end
-        }
-        for (rc in activeTexts) {
-            val c = rc.clip
-            val localT = playheadSec - rc.start
-            val anim = TimelineEngine.animatedProps(c, localT)
-            val alphaInt = ((anim.opacity / 100.0) * 255.0).roundToInt().coerceIn(0, 255)
-            val scaleFactor = min(width / 1280f, height / 720f)
-            val pxSize = max(10f, c.fontSize * (anim.scale.toFloat() / 100f) * scaleFactor)
-
-            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = try { Color.parseColor(c.textColor) } catch (_: Exception) { Color.WHITE }
-                alpha = alphaInt
-                textSize = pxSize
-                typeface = Typeface.create(
-                    when (c.fontFamily) {
-                        "monospace" -> Typeface.MONOSPACE
-                        "serif", "Georgia" -> Typeface.SERIF
-                        else -> Typeface.SANS_SERIF
-                    },
-                    if (c.fontWeight >= 700) Typeface.BOLD else Typeface.NORMAL
-                )
-                textAlign = when (c.textAlign) {
-                    "left" -> Paint.Align.LEFT
-                    "right" -> Paint.Align.RIGHT
-                    else -> Paint.Align.CENTER
-                }
-                if (c.shadow) {
-                    setShadowLayer(pxSize * 0.18f, 0f, pxSize * 0.05f, Color.argb(200, 0, 0, 0))
-                }
-            }
-
-            val lines = c.text.ifEmpty { "Text" }.split("\n")
-            val lineH = pxSize * 1.18f
-            val baseX = when (c.textAlign) {
-                "left" -> width * 0.08f
-                "right" -> width * 0.92f
-                else -> width / 2f
-            } + ((anim.x / 100.0) * width).toFloat()
-
-            var baseY = when (c.verticalPosition) {
-                "top" -> height * 0.18f - (lines.size - 1) * lineH / 2f
-                "bottom" -> height * 0.82f - (lines.size - 1) * lineH / 2f
-                else -> height / 2f - (lines.size - 1) * lineH / 2f
-            } + ((anim.y / 100.0) * height).toFloat()
-
-            for (line in lines) {
-                if (c.strokeWidth > 0f) {
-                    val strokePaint = Paint(textPaint).apply {
-                        style = Paint.Style.STROKE
-                        strokeWidth = c.strokeWidth * scaleFactor * 2f
-                        color = try { Color.parseColor(c.strokeColor) } catch (_: Exception) { Color.BLACK }
-                        alpha = alphaInt
-                    }
-                    canvas.drawText(line, baseX, baseY, strokePaint)
-                }
-                canvas.drawText(line, baseX, baseY, textPaint)
-                baseY += lineH
-            }
-        }
+        // Motion graphics and titles, drawn by the renderer the preview also uses.
+        TitleRenderer.drawTitles(canvas, width, height, playheadSec, allResolved, trackStates)
     }
 
-    private fun drawContainedBitmap(canvas: Canvas, bmp: Bitmap, stageW: Int, stageH: Int, paint: Paint) {
+    /**
+     * Draws [bmp] fitted inside the frame and centred on the origin. With [cornerPx] the picture
+     * is drawn through a bitmap shader into a rounded rectangle, which keeps the corners
+     * anti-aliased where a clip path would leave them jagged.
+     */
+    private fun drawContainedBitmap(
+        canvas: Canvas,
+        bmp: Bitmap,
+        stageW: Int,
+        stageH: Int,
+        paint: Paint,
+        cornerPx: Float = 0f
+    ) {
         val bw = max(1, bmp.width)
         val bh = max(1, bmp.height)
         val ratio = min(stageW.toFloat() / bw, stageH.toFloat() / bh)
         val dw = bw * ratio
         val dh = bh * ratio
         val dst = RectF(-dw / 2f, -dh / 2f, dw / 2f, dh / 2f)
-        canvas.drawBitmap(bmp, null, dst, paint)
+        if (cornerPx <= 0.5f) {
+            canvas.drawBitmap(bmp, null, dst, paint)
+            return
+        }
+        val shader = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+        shader.setLocalMatrix(
+            Matrix().apply { setRectToRect(RectF(0f, 0f, bw.toFloat(), bh.toFloat()), dst, Matrix.ScaleToFit.FILL) }
+        )
+        val previous = paint.shader
+        paint.shader = shader
+        canvas.drawRoundRect(dst, cornerPx, cornerPx, paint)
+        paint.shader = previous
     }
 
     private fun argbToNv12(argb: IntArray, yuv: ByteArray, width: Int, height: Int) {

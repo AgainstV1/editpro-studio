@@ -141,6 +141,12 @@ class AgentEngine(private val tools: McpTools) {
             - If the user asks for something you cannot do with the available tools, say so plainly
               instead of improvising. You cannot export, and you cannot clear the whole timeline.
             - You can fetch a media file from a URL with fetch_url, then place it with add_clip.
+            - To animate a clip (move, zoom, spin, fade) write keyframes with set_keyframe: two
+              keyframes with different values make the change between them.
+            - Titles, lower thirds, counters, bars and shapes come from add_motion_graphic (see
+              list_motion_graphics); restyle them afterwards with update_clip.
+            - To act on several clips at once use edit_clips and move_clips rather than repeating
+              single-clip calls.
 
             Style:
             - After making changes, reply with one or two sentences describing what you did, not a

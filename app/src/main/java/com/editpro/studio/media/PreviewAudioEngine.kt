@@ -1,28 +1,36 @@
 package com.editpro.studio.media
 
 import android.media.MediaPlayer
+import android.media.PlaybackParams
+import android.os.SystemClock
+import com.editpro.studio.model.AudioDsp
 import com.editpro.studio.model.MediaAsset
 import com.editpro.studio.model.ResolvedClip
 import com.editpro.studio.model.TimelineClip
 import com.editpro.studio.model.TimelineEngine
 import com.editpro.studio.model.TimelineTrack
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * Plays the timeline's audio clips during preview, roughly in sync with the playhead.
+ * Plays the timeline's sound during preview, roughly in sync with the playhead.
  *
- * Preview only. Each audio clip gets its own `MediaPlayer`, started at the correct source
- * offset (honouring trim and the current playhead), with per-clip volume, fades and volume
- * automation applied as playback advances. Mute/solo is resolved by the caller.
+ * Preview only. Every clip that carries sound — clips on the audio tracks and the soundtrack of
+ * video clips — gets its own `MediaPlayer`, started at the correct source offset (honouring trim,
+ * speed and the current playhead), with volume, fades, volume automation and stereo balance
+ * applied as playback advances. Mute/solo is resolved by the caller. EQ and compression are
+ * applied on export only.
  *
  * Every operation is defensive: a codec that refuses a file, a missing media file or a player
  * that dies mid-clip degrades to silence rather than interrupting editing.
  *
- * The exported MP4's audio is a completely separate pipeline (see NativeVideoExporter).
+ * The exported MP4's audio is a completely separate pipeline (see TimelineAudioEncoder).
  */
 class PreviewAudioEngine {
 
@@ -39,7 +47,7 @@ class PreviewAudioEngine {
     /**
      * Starts every audible clip that is still ahead of (or under) [fromSec].
      *
-     * @param audibleTracks audio tracks that should be heard — mute/solo already resolved.
+     * @param audibleTracks tracks that should be heard — mute/solo already resolved.
      */
     fun start(
         scope: CoroutineScope,
@@ -49,35 +57,78 @@ class PreviewAudioEngine {
         fromSec: Double
     ) {
         stop()
+        // The moment the playhead was at [fromSec]. Every cue below is measured from it, so the
+        // time spent opening a file never makes its clip late.
+        val startedAt = SystemClock.elapsedRealtime()
         scheduler = scope.launch {
             for (rc in clips) {
                 val clip = rc.clip
-                if (!clip.track.isAudio || clip.track !in audibleTracks) continue
-                if (rc.end <= fromSec) continue
-
+                if (clip.track !in audibleTracks) continue
+                if (rc.end <= fromSec + 0.02) continue
                 val asset = clip.assetId?.let { assets[it] } ?: continue
+                if (!TimelineEngine.carriesSound(clip, asset)) continue
+                if (clip.volume <= 0.0 && clip.volumeKeyframes.isEmpty()) continue
                 val path = asset.localPath ?: continue
                 if (!File(path).exists()) continue
 
-                // Clips that begin later wait for their cue.
-                val delayMs = ((rc.start - fromSec) * 1000.0).toLong()
-                if (delayMs > 0L) delay(delayMs)
+                // Each clip waits for its own cue, so a late clip is not held up by earlier ones.
+                launch {
+                    // Milliseconds from the start of playback to the clip's first frame; negative
+                    // when the clip is already under the playhead.
+                    val cueMs = ((rc.start - fromSec) * 1000.0).toLong()
+                    val openIn = cueMs - OPEN_AHEAD_MS - (SystemClock.elapsedRealtime() - startedAt)
+                    if (openIn > 0L) delay(openIn)
 
-                val offsetSec = clip.trimIn + (fromSec - rc.start).coerceAtLeast(0.0)
-                val player = MediaPlayer()
-                try {
-                    player.setDataSource(path)
-                    player.prepare()
-                    player.seekTo((offsetSec * 1000.0).toLong().toInt().coerceAtLeast(0))
-                    val gain = gainFor(clip, (fromSec - rc.start).coerceAtLeast(0.0), rc.duration)
-                    player.setVolume(gain, gain)
-                    player.start()
-                    active.add(player to clip)
-                } catch (e: Exception) {
-                    release(player)
+                    val speed = clip.speed.coerceIn(0.25, 4.0)
+                    val player = MediaPlayer()
+                    var handedOver = false
+                    try {
+                        // Opening a file can take a few hundred milliseconds, more for video.
+                        // It happens off the main thread so playback never freezes the editor,
+                        // and a little before the cue so the clip can still start on time.
+                        withContext(Dispatchers.IO) {
+                            player.setDataSource(path)
+                            player.prepare()
+                        }
+                        val early = cueMs - (SystemClock.elapsedRealtime() - startedAt)
+                        if (early > 0L) {
+                            // Ready ahead of time: line up on the clip's first frame and wait.
+                            seek(player, clip.trimIn)
+                            delay(early)
+                        }
+                        // Where the playhead is inside the clip by now.
+                        val localSec = ((SystemClock.elapsedRealtime() - startedAt - cueMs) / 1000.0).coerceAtLeast(0.0)
+                        if (localSec < rc.duration) {
+                            if (early <= 0L) seek(player, clip.trimIn + localSec * speed)
+                            applyVolume(player, clip, localSec, rc.duration)
+                            if (speed != 1.0) {
+                                // Setting playback params also starts the player on most devices.
+                                runCatching { player.playbackParams = PlaybackParams().setSpeed(speed.toFloat()) }
+                            }
+                            if (!player.isPlaying) player.start()
+                            active.add(player to clip)
+                            handedOver = true
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // A file the player refuses is simply not heard.
+                    } finally {
+                        // Stopped while it was still opening, or failed: nothing else owns it.
+                        if (!handedOver) release(player)
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * Moves a player to an exact source time. The plain `seekTo` lands on the previous video key
+     * frame, which for the sound of a video clip can be a second or more early; the picture is
+     * frame-accurate, so the sound has to be as well.
+     */
+    private fun seek(player: MediaPlayer, sourceSec: Double) {
+        player.seekTo((sourceSec * 1000.0).toLong().coerceAtLeast(0L), MediaPlayer.SEEK_CLOSEST)
     }
 
     /**
@@ -95,20 +146,26 @@ class PreviewAudioEngine {
                 continue
             }
             if (playheadSec < rc.start) continue
-            val gain = gainFor(clip, playheadSec - rc.start, rc.duration)
-            runCatching { player.setVolume(gain, gain) }
+            applyVolume(player, rc.clip, playheadSec - rc.start, rc.duration)
         }
     }
 
-    private fun gainFor(clip: TimelineClip, localSec: Double, durationSec: Double): Float {
+    private fun applyVolume(player: MediaPlayer, clip: TimelineClip, localSec: Double, durationSec: Double) {
         val base = (clip.volume / 100.0).coerceIn(0.0, 2.0)
         val envelope = TimelineEngine.audioEnvelope(clip, localSec, durationSec)
-        return (base * envelope).coerceIn(0.0, 1.0).toFloat()
+        val gain = (base * envelope).coerceIn(0.0, 1.0).toFloat()
+        val (left, right) = AudioDsp.panGains(clip.audioPan)
+        runCatching { player.setVolume(gain * left, gain * right) }
     }
 
     private fun release(player: MediaPlayer) {
         runCatching { if (player.isPlaying) player.stop() }
         runCatching { player.reset() }
         runCatching { player.release() }
+    }
+
+    private companion object {
+        /** How long before its cue a clip's file is opened. */
+        const val OPEN_AHEAD_MS = 600L
     }
 }

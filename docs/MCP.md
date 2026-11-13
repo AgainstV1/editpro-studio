@@ -48,7 +48,7 @@ The transport is MCP **Streamable HTTP**, POST-only: a request gets a plain `app
 response rather than an SSE stream. Servers and clients that require SSE streaming are not
 supported, which is the one compatibility limit to be aware of.
 
-There is also `GET /health`, which returns `{"status":"ok","server":"editpro-studio","tools":20}`
+There is also `GET /health`, which returns `{"status":"ok","server":"editpro-studio","tools":28}`
 and needs no token.
 
 ### Testing without an agent
@@ -73,14 +73,17 @@ tells you whether tool dispatch works. Run it on the tablet itself, or over `adb
 | `get_summary` | Project name, duration, playhead, selection, per-track state, counts. Start here. |
 | `get_project` | The whole project as `.filmcraft` JSON. |
 | `list_media` | Media assets, with the ids `add_clip` needs. |
-| `list_clips` | Every clip: track, start/end, trim, transform, keyframe count. |
+| `list_clips` | Every clip: track, start/end, trim, transform, keyframe count, motion-graphic id. |
 | `list_look_presets` | Colour looks, for `apply_look`. |
 | `fetch_url` | **The browser.** Download an image, video or audio file from a direct URL into the media library, ready for `add_clip`. http/https, 250 MB, 60 s timeout. |
 | `add_clip` | Place an asset on a track at a time. Returns the clip id. |
-| `update_clip` | Change any property of one clip — position, trim, track, transform, volume, text, fades, full colour grade. Only the keys you pass change. |
+| `update_clip` | Change any property of one clip — position, trim, track, transform, volume, pan, speed, text, colours, motion-graphic fields, fades, full colour grade. Only the keys you pass change. |
 | `delete_clip` | Remove one clip. |
 | `split_clip` | Cut a clip in two at an absolute time. |
-| `set_track_state` | Mute, hide, solo or lock a track. |
+| `set_track_state` | Mute, hide, solo, lock or collapse a track. |
+| `select_clips` | Select clips in the editor, so the user sees what is about to change. |
+| `move_clips` | Slide several clips together, keeping their spacing; stops at the first obstacle. |
+| `edit_clips` | Multi-clip edits: ripple delete, duplicate, copy, cut, paste, close gaps, detach audio, trim and ripple-trim at a time. |
 | `add_text` | Create a title clip and set its words. |
 | `add_marker` | Marker at the playhead. |
 | `seek` | Move the playhead. |
@@ -89,11 +92,18 @@ tells you whether tool dispatch works. Run it on the tablet itself, or over `adb
 | `set_project_name` | Rename the project. |
 | `apply_look` | Apply a colour look preset to one clip. |
 | `add_keyframe` | Keyframe a clip at a time, capturing its current transform. |
+| `list_keyframes` | A clip's keyframes with their values and easing. |
+| `set_keyframe` | Write a keyframe with given scale / opacity / rotation / x / y and easing — two of them make a move. |
+| `remove_keyframe` | Delete the keyframe at a time. |
+| `list_motion_graphics` | The motion-graphics templates. |
+| `add_motion_graphic` | Add a template as a clip, with its text. |
 
 ### Deliberately absent
 
 - **Export.** Starting a render is expensive and long-running; an agent should not do it silently.
 - **Timeline-wide clears.** Destructive and easy to trigger by accident.
+- **Project management.** Creating, opening and deleting projects stays with the user; the agent
+  edits the project that is open.
 - **Web search.** The agent already knows how to find things; a search API would mean a key, a
   provider and a rate limit. `fetch_url` takes a direct media link instead.
 - **`blur`, `hue`, `grain`.** These are stored by the model but not applied to the render (they are

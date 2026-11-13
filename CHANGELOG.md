@@ -2,6 +2,126 @@
 
 All notable changes to Edit Pro Studio (Android). Newest first.
 
+## 3.0.0 — unreleased
+
+The editing overhaul. The app now keeps separate projects, the timeline edits several clips at
+once, animation is editable, the preview shows what the export will contain, and every keyboard
+action can be rebound.
+
+### Added
+- **Projects, each in its own folder.** The app opens on a front page of project cards (thumbnail,
+  length, clip count, size, when it was last edited). A card opens with a tap; its menu renames,
+  duplicates or deletes it. A project owns its edit *and* the media imported into it, so deleting
+  one removes exactly that project's files. New projects start from a dialog that asks for a
+  name, a shape (16:9, 9:16, 1:1, 4:3), a size and a frame rate. The single autosaved edit of
+  earlier versions becomes the first project, with its media moved into the project's folder.
+- **Multi-clip editing.** Ctrl-click adds to the selection, Shift-click selects a range, dragging
+  across empty space draws a marquee (long-press first on touch), and a *Multi* toggle makes every
+  tap additive for fingers. A selection moves as a group and stops at the first clip in its way.
+  Cut, copy and paste keep the clips' spacing; ripple delete, ripple trim (Q / W), trim to
+  playhead, close gaps, insert space, split every track, select everything after the playhead and
+  nudge by frames all work on the selection.
+- **Dragging between tracks.** A clip follows the pointer up and down as well as along, onto any
+  track that can hold it.
+- **Detach audio.** A video clip's sound becomes its own clip on an audio track.
+- **Replace media.** Swap the file behind a clip and keep its grade, motion and position.
+- **Collapsible tracks.** Each track folds to a thin strip from its header; there are commands to
+  fold all tracks and to fold the empty ones. A new **GRAPHICS** track sits between the picture
+  tracks and the text track.
+- **Collapsible panels.** The media library, the inspector and the timeline each fold away, and the
+  preview can be maximised. The layout is remembered.
+- **Context menus everywhere.** Right-click or long-press a clip, a track header, a marker, the
+  ruler, empty timeline space, a library item or a project card. The clip menu is still the
+  user's own list and now shows the key currently bound to each entry.
+- **Keyframe editing.** Changing Scale, Position, Rotation or Opacity on an animated clip keys the
+  change at the playhead, so a slider always changes what is on screen. Each keyframe chooses how
+  it eases into the next (clip curve, linear, ease, ease in, ease out, hold). A keyframe lane in
+  the timeline shows the selected clip's keyframes as diamonds that can be dragged, and the
+  inspector lists them with previous / next / add / delete. Splitting or trimming an animated clip
+  keeps the animation attached to the picture.
+- **Motion graphics.** 17 templates: lower third, title card, typewriter, quote, chapter tag,
+  credits roll, callout, subscribe button, countdown, number counter, running timer, progress bar,
+  cinematic bars, rectangle, ellipse, divider line and arrow. Each one becomes an ordinary clip —
+  retype it, recolour it, trim it, keyframe it. The picker shows a real frame of each.
+- **Rebindable keyboard shortcuts.** About 85 actions, every one listed in *Keyboard shortcuts*
+  with a *Change* button that waits for the next key press. A key already in use is only taken
+  over after confirmation. New defaults include J / K / L shuttle, frame stepping with the arrow
+  keys, Up / Down to jump between cuts, I / O for the export range and Ctrl+C / X / V.
+- **Media library housekeeping.** Multi-select, add several items to the timeline in one go, rename,
+  select unused media, and remove media from the project (with its clips, after a confirmation,
+  and undoable). Items used on the timeline carry an *In use* badge.
+- **Markers** can be renamed and deleted, show their labels, and the export range is drawn on the
+  ruler.
+- **Assistant and MCP tools** for the new operations: `list_keyframes`, `set_keyframe`,
+  `remove_keyframe`, `list_motion_graphics`, `add_motion_graphic`, `select_clips`, `move_clips`
+  and `edit_clips`. `set_track_state` can collapse a track and `update_clip` reaches the
+  motion-graphics fields, speed and pan.
+
+### Changed
+- **The preview is drawn by the export compositor.** It now shows real video frames (it used to
+  show a placeholder for video), and layer order, grade, motion, fades, titles and graphics are the
+  same code path as the rendered file. While paused the nearest key frame appears at once and the
+  exact frame follows when the playhead rests.
+- **Export uses the exact video frame** for every output frame instead of the nearest key frame.
+  Key frames are often a second apart, which made exported motion stutter. Renders that contain
+  video are slower as a result.
+- **Video clips carry their sound**, in the preview and in the export. Solo is resolved across
+  picture and audio tracks, and picture tracks have their own mute and solo.
+- **Export audio is processed**: the five-band EQ, the compressor, pan and a soft limiter are now
+  applied. De-essing and reverb still are not; see `docs/MAINTENANCE.md`.
+- **Export audio is mixed as a stream**, about a tenth of a second at a time, instead of being
+  decoded and mixed whole in memory. The five-minute limit on a render's sound is gone (the
+  ceiling is now an hour), and a long clip no longer risks running the tablet out of memory.
+- **A render says when sound is missing.** If a clip's audio cannot be read, or the mix fails
+  altogether, the picture still exports and the result names what is missing, instead of
+  delivering a silent file as a success. The export sheet shows progress while the sound is
+  mixed, and cancelling works during it.
+- **Edge trims stop at the neighbouring clip**, at the start of the timeline and at the ends of
+  the source, and snap to cuts, markers and the playhead.
+- **Timeline zoom** runs from a whole long edit down to a few frames. Ctrl + mouse wheel zooms
+  around the pointer, a two-finger pinch zooms on touch, Shift + wheel scrolls sideways, and
+  *Fit* really fits long edits.
+- **Undo covers the media library**, and a slider drag is one undo step.
+- **Save writes into the project.** Projects autosave, and are saved when the app leaves the
+  foreground. Exporting and importing `.filmcraft` files moved to Tools and the front page.
+- **New, Open and Demo no longer ask before replacing your work**, because they no longer replace
+  it: each is a separate project.
+- **Changing the export shape or size changes the preview frame**, so what is framed is what is
+  rendered.
+- **Layers follow track order** (VIDEO 1 at the bottom), and at a cut only the incoming clip is
+  drawn.
+- **Clip speed changes clip length.** A 2× clip now occupies half its source span on the timeline.
+- Still images are decoded at the size they are needed and the right way up (EXIF orientation).
+- The project file is format version 3. It only adds fields (track states, motion graphics,
+  keyframe easing), so files from earlier versions open unchanged.
+
+### Fixed
+- Dragging a clip a second time could send it back to where the first drag started, and dragging
+  the playhead readout scrubbed from a stale position: the gesture code held on to old values.
+- Trimming an edge into a neighbouring clip made the clip jump to the other side of it.
+- Typing in the inspector's text fields with a hardware keyboard triggered editor shortcuts.
+- Hover-scrub (*playhead follows cursor*) was offset by the scroll position once the timeline was
+  scrolled.
+- A long edit at high zoom could ask for a timeline wider than a layout can be.
+- Portrait photos could appear on their side.
+- The MCP server reported a fixed, out-of-date version number.
+- Exports longer than five minutes went silent after the five-minute mark.
+- Surround (5.1 / 7.1) audio was read as if it were stereo, which scrambled it in the export. It
+  is now folded down to stereo with the dialogue channel kept.
+- 24-bit and floating-point audio files could be read as 16-bit, which turns them into noise.
+- In the preview, the sound of a video clip started from the key frame before the playhead, up
+  to a second or more early. It now starts from the exact position, like the picture.
+- Pressing play froze the editor while each sound file was opened. Files are now opened in the
+  background, shortly before their clip is due.
+- A stutter in the interface during playback left the picture behind the sound for the rest of
+  the take.
+- Playback carried on, audibly, after leaving the app.
+- A cancelled or failed export left a broken file in the exports folder, had already deleted the
+  previous render of the same project, and kept the video encoder open. A render is now written
+  beside its final name and moved into place only when it is whole.
+- An export whose file could not be finished (a full disk, or an encoder that produced nothing)
+  was reported as a success.
+
 ## 2.9.0 — unreleased
 
 ### Added

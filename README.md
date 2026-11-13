@@ -20,33 +20,47 @@ on-stage overlays rather than the whole layout, so the timeline stays where it i
 
 | Mode | Purpose |
 | --- | --- |
-| **Normal** | Assembly — trim, split, ripple delete, text and titles |
+| **Normal** | Assembly — trim, split, ripple edits, text, titles and motion graphics |
 | **Colour** | Three-way grading with live RGB parade, waveform and histogram scopes |
-| **Motion** | Keyframes with cubic-bezier easing, and 3D camera rigs (tilt, swivel, anamorphic) |
+| **Motion** | Keyframes with per-keyframe easing, and 3D camera rigs (tilt, swivel, anamorphic) |
 | **Music** | Five-band EQ, mastering presets, volume automation and beat detection |
 
-Around that sit a six-track timeline (two video, one overlay, text, two audio), a media library
-that imports through the Storage Access Framework, and an export dialog with resolution, aspect,
-frame rate and quality controls.
+Around that sit a seven-track timeline (two video, one overlay, graphics, text, two audio), a media
+library that imports through the Storage Access Framework, and an export dialog with resolution,
+aspect, frame rate and quality controls. The app opens on a front page of projects; each project
+keeps its edit and its media in a folder of its own.
 
 ## Features
 
 **Timeline**
-Six tracks, magnetic snapping, split at playhead, ripple delete, multi-select, per-track
-lock / hide / mute / solo, markers, and a render queue.
+Seven tracks with magnetic snapping. Select several clips (Ctrl / Shift click, a marquee, or the
+*Multi* toggle on touch) and move, cut, copy, paste, duplicate or ripple-delete them together.
+Drag a clip between tracks, drag an edge to trim, split, ripple-trim to the playhead, close gaps,
+detach a video's audio. Tracks lock, hide, mute, solo and collapse; panels collapse too. Right-click
+or long-press a clip, a track header, a marker or empty space for its menu.
 
 **Colour**
 58 look presets, three-way lift / gamma / gain wheels, and live scopes (parade, waveform,
 histogram) with a split-screen before-and-after wipe.
 
 **Motion**
-55+ motion presets, editable cubic-bezier easing, keyframes, and camera-rig presets modelled on
-real bodies and glass (ARRI, RED, Panavision, 16 mm, Super 8).
+Keyframes for scale, position, rotation, opacity and grade, with an easing choice per keyframe, a
+keyframe lane in the timeline and an editor in the inspector. Changing a value on an animated clip
+keys it at the playhead. Plus 55+ motion presets and camera-rig presets modelled on real bodies and
+glass (ARRI, RED, Panavision, 16 mm, Super 8).
+
+**Motion graphics**
+17 animated templates — lower third, title card, typewriter, quote, credits roll, callout,
+countdown, number counter, progress bar, cinematic bars, shapes and more. Each is an ordinary clip
+whose text and colours are edited in the inspector.
 
 **Audio**
-Volume automation, fade in / out, five-band EQ and mastering-style presets. Volume, fades and
-automation are applied to both preview and export; the EQ and mastering controls are currently
-UI-only — see [docs/MAINTENANCE.md](docs/MAINTENANCE.md).
+Video clips carry their own sound, which can be detached onto an audio track. Volume, fades and
+volume automation apply to preview and export; the five-band EQ, compressor and pan are applied to
+the export (the preview applies pan only). The export mixes mono, stereo and surround sources into
+one stereo track, streaming them so a long edit keeps its sound to the end, and says so if a
+clip's audio could not be read. De-essing and reverb are not processed yet — see
+[docs/MAINTENANCE.md](docs/MAINTENANCE.md).
 
 **Export**
 Native H.264 video with a stereo AAC audio track, via `MediaCodec` + `MediaMuxer`. Aspect
@@ -54,8 +68,13 @@ Native H.264 video with a stereo AAC audio track, via `MediaCodec` + `MediaMuxer
 cancellable renders. Finished files are published to `Movies/EditPro` so they appear in Photos.
 
 **Projects**
-Portable `.filmcraft` JSON, saved through the system file picker, with autosave and recovery, a
-recent-project list, and confirmation before anything would discard current work.
+A front page of project cards: open, rename, duplicate, delete, or start a new one with a chosen
+shape, size and frame rate. Projects autosave into their own folders together with their media.
+A project can also be exported to, and imported from, a portable `.filmcraft` JSON file.
+
+**Keyboard**
+More than 80 actions, all rebindable from *Tools → Keyboard shortcuts*: J / K / L shuttle, frame
+stepping, jump between cuts, Ctrl+C / X / V, ripple trims, keyframe navigation, panel toggles.
 
 ## Requirements
 
@@ -94,24 +113,35 @@ an update will not install over a previously installed copy.
 
 ```
 app/src/main/java/com/editpro/studio/
-├── MainActivity.kt     Compose host, workspace layout, keyboard shortcuts, file intents
+├── MainActivity.kt     Compose host, workspace layout, key handling, media library, file intents
 ├── viewmodel/          Single source of truth (EditorUiState) and every editing operation
-├── model/              Data types, timeline engine, preset catalogue, project serialisation
-├── media/              Media import, preview audio, MediaCodec export pipelines
-└── ui/                 Compose panels: preview stage, timeline, inspector, dialogs, home screen
+├── model/              Data types and the pure logic: timeline engine and edits (TimelineOps),
+│                       keyframes (KeyframeOps), key map (Shortcuts), motion-graphics timing,
+│                       audio DSP and the clip mixer, project storage (ProjectStore) and
+│                       serialisation
+├── media/              Media import, the frame compositor shared by preview and export,
+│                       the title / motion-graphics renderer, preview audio, MediaCodec export
+├── agent/, mcp/        The built-in assistant and the MCP server, over one shared tool layer
+└── ui/                 Compose panels: preview stage, timeline, inspector, dialogs, project list
 ```
 
 State lives in one `StateFlow<EditorUiState>`. Editing operations are pure functions over that
 state with snapshot-based undo and redo, which keeps the timeline engine testable without an
-Android runtime — that is what the JVM test suite covers.
+Android runtime — that is what the JVM test suite covers. The preview and the export draw each
+frame with the same function (`NativeVideoExporter.renderCompositeFrame`), so they cannot drift
+apart.
 
 ## Status
 
 Actively used, but early. Worth knowing before relying on it:
 
-- **Verification is compile-time.** CI runs the JVM unit tests (timeline engine, serialisation,
-  export dimension maths) and builds the APKs. There are **no instrumentation tests**, so UI,
-  media and file-system behaviour is verified by hand against a written checklist.
+- **Verification is compile-time.** CI runs the JVM unit tests (timeline engine and edits,
+  keyframes, key map, project storage, serialisation, and the export's audio mix, which is also
+  run against stand-in codecs) and builds the APKs. There are **no instrumentation tests**, so
+  UI, media and file-system behaviour is verified by hand against a written checklist.
+- **Video preview is frame-accurate, not real-time.** Frames come from Android's
+  `MediaMetadataRetriever`, which is exact but slow, so video plays back in the preview at a
+  reduced frame rate while the sound runs at full speed. The export is unaffected.
 - **Some controls are not yet wired to the render output.** Rather than pretend, they are labelled
   "not rendered yet" in the inspector. The full list, and the manual test checklist, live in
   [docs/MAINTENANCE.md](docs/MAINTENANCE.md).
