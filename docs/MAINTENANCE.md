@@ -13,8 +13,17 @@ There is no instrumentation test suite.
 The unit tests cover the pure logic only: the timeline engine (snapping, collision resolution,
 interpolation and easing, audio envelope, SRT parsing), multi-clip edits (split, ripple, trim,
 paste, group moves, edge trims), keyframe edits, the key map and rebinding, project storage on
-disk, the project file round-trip, motion-graphics timing, audio DSP, preset catalog sizes and
-export dimension maths.
+disk, the project file round-trip, motion-graphics timing, audio DSP, the export's sound mix
+(placing, retiming and fading a clip, folding surround down, reading a file through a small
+window), preset catalog sizes and export dimension maths.
+
+The export's sound path is also run from file to encoder (`AudioExportTest`), against stand-in
+codecs kept with the tests in `app/src/test/java/android/media/StandInCodecs.kt`. Made-up files
+of every shape go through `TimelineAudioEncoder`, and what reaches the encoder is compared sample
+for sample with what the timeline should sound like; the same tests cover a missing file, a
+decoder that fails part-way, a cancelled export, and that every codec is released. The stand-ins
+follow `MediaCodec`'s buffer protocol but are not Android's codecs, so this shows the
+bookkeeping is right, not that a real file decodes: that is still items 20 and 21 below.
 
 The 3.0 editing overhaul (project list, multi-select timeline, keyframe lane, motion graphics,
 shared preview compositor, rebindable shortcuts) was written without a device to run it on: it
@@ -22,9 +31,9 @@ compiles, its logic is unit-tested and CI builds it, but **none of its screens o
 been exercised on a device when it was merged**. The checklist below is the list of what to try
 first.
 
-Anything touching Compose UI, MediaCodec, the file system or the Storage Access Framework has
-**never been run in an automated test**. Treat those changes as unverified until someone
-installs the APK and tries them.
+Anything touching Compose UI, Android's real codecs, the file system or the Storage Access
+Framework has **never been run in an automated test**. Treat those changes as unverified until
+someone installs the APK and tries them.
 
 ## Manual test checklist
 
@@ -44,7 +53,9 @@ if it broke.
    the export dialog. Confirm the file plays, has sound, and shows up in your Photos/Gallery app
    under `Movies/EditPro`.
 5. **Cancel a render** — start a longer render and hit *Cancel export*. The progress bar should
-   stop, the button should return to *Render MP4*, and the app should stay usable.
+   stop, the button should return to *Render MP4*, and the app should stay usable. Cancel a
+   re-render of something you have already exported: the earlier file must still open, and the
+   next render must start normally.
 6. **Import batch** — import several files at once, including one unsupported file and one
    duplicate. Confirm the summary names what was skipped.
 7. **Project list** — relaunch the app and confirm the project list appears with a card per
@@ -77,6 +88,15 @@ if it broke.
     show the video's own frames (at a reduced frame rate) with sound.
 19. **Panels** — collapse and restore the library, the inspector and the timeline, maximise the
     preview, and relaunch to confirm the collapsed state is remembered.
+20. **Sound in the export** — render an edit with a camera video, a music track and a cut in the
+    middle of the video, and check the sound against the picture at the start, at the cut and at
+    the end. Then render something longer than five minutes and confirm the sound runs to the
+    end. If you have them, try a 5.1 file (dialogue must be audible) and a 24-bit WAV or FLAC
+    (must not be noise). Put a file the device cannot decode on the timeline and confirm the
+    export still finishes and says whose sound is missing.
+21. **Sound in the preview** — play from the middle of a video clip and across a cut in it: the
+    sound should match the picture, and pressing play should not freeze the editor. Press Home
+    while playing: the sound must stop.
 
 ## What actually renders
 
@@ -116,7 +136,9 @@ implementing them later will light up existing projects rather than requiring a 
 Audio is closer to complete than it was. **Volume, fades and volume automation are applied** in
 both preview and export, and a **video clip's own sound** is included in both. The export mixes
 every audible clip into one stereo AAC track at 44.1 kHz and applies **the five-band EQ, the
-compressor, pan and a soft limiter**. The preview applies pan and clip speed but not EQ or
+compressor, pan and a soft limiter**. The mix is streamed — each file is decoded only as far as
+it has been heard — so memory does not grow with the length of the render, and surround sources
+are folded down to stereo. The preview applies pan and clip speed but not EQ or
 compression, so a heavily processed clip sounds plainer while editing than in the render.
 **De-essing and reverb are stored and shown in the UI but are not applied** anywhere.
 
@@ -128,9 +150,16 @@ compression, so a heavily processed clip sounds plainer while editing than in th
   A streaming `MediaCodec` decoder would fix both this and the next point.
 - **Exports with video are slow** for the same reason: every output frame asks for the exact
   source frame. The previous behaviour (nearest key frame) was fast and visibly wrong.
-- **Export audio: de-essing and reverb are not processed.** Audio is capped at 5 minutes per
-  render and clip `speed` shifts pitch rather than time-stretching. Shuttling the preview (J / L
-  at other than normal speed) is silent.
+- **Export audio: de-essing and reverb are not processed.** Clip `speed` shifts pitch rather than
+  time-stretching. One render carries at most an hour of sound (`TimelineAudioEncoder.MAX_SECONDS`):
+  the mix itself is streamed, but the encoded track is held in memory, about a megabyte a minute,
+  until the picture has been written, and the result says so if the sound was cut. Writing the
+  AAC frames to the muxer as the picture advances would remove the ceiling and interleave the
+  file properly. Shuttling the preview (J / L at other than normal speed) is silent.
+- **Preview sound is started, not slaved.** Each clip gets a `MediaPlayer` that is opened ahead
+  of its cue and started at the exact source position; after that it runs on its own clock.
+  Nothing re-checks its position against the playhead, so an edit made while playing is not
+  heard until playback restarts.
 - **Only fade and dissolve entrances render.** Other entrance transitions are stored but not
   drawn, and every exit transition is drawn as a fade. Clip transitions do not apply to motion
   graphics, which have their own intro and outro.

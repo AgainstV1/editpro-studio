@@ -2,16 +2,20 @@ package com.editpro.studio.media
 
 import android.media.MediaPlayer
 import android.media.PlaybackParams
+import android.os.SystemClock
 import com.editpro.studio.model.AudioDsp
 import com.editpro.studio.model.MediaAsset
 import com.editpro.studio.model.ResolvedClip
 import com.editpro.studio.model.TimelineClip
 import com.editpro.studio.model.TimelineEngine
 import com.editpro.studio.model.TimelineTrack
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -53,6 +57,9 @@ class PreviewAudioEngine {
         fromSec: Double
     ) {
         stop()
+        // The moment the playhead was at [fromSec]. Every cue below is measured from it, so the
+        // time spent opening a file never makes its clip late.
+        val startedAt = SystemClock.elapsedRealtime()
         scheduler = scope.launch {
             for (rc in clips) {
                 val clip = rc.clip
@@ -66,30 +73,62 @@ class PreviewAudioEngine {
 
                 // Each clip waits for its own cue, so a late clip is not held up by earlier ones.
                 launch {
-                    val delayMs = ((rc.start - fromSec) * 1000.0).toLong()
-                    if (delayMs > 0L) delay(delayMs)
+                    // Milliseconds from the start of playback to the clip's first frame; negative
+                    // when the clip is already under the playhead.
+                    val cueMs = ((rc.start - fromSec) * 1000.0).toLong()
+                    val openIn = cueMs - OPEN_AHEAD_MS - (SystemClock.elapsedRealtime() - startedAt)
+                    if (openIn > 0L) delay(openIn)
 
                     val speed = clip.speed.coerceIn(0.25, 4.0)
-                    val localSec = (fromSec - rc.start).coerceAtLeast(0.0)
-                    val offsetSec = clip.trimIn + localSec * speed
                     val player = MediaPlayer()
+                    var handedOver = false
                     try {
-                        player.setDataSource(path)
-                        player.prepare()
-                        player.seekTo((offsetSec * 1000.0).toLong().toInt().coerceAtLeast(0))
-                        applyVolume(player, clip, localSec, rc.duration)
-                        if (speed != 1.0) {
-                            // Setting playback params also starts the player on most devices.
-                            runCatching { player.playbackParams = PlaybackParams().setSpeed(speed.toFloat()) }
+                        // Opening a file can take a few hundred milliseconds, more for video.
+                        // It happens off the main thread so playback never freezes the editor,
+                        // and a little before the cue so the clip can still start on time.
+                        withContext(Dispatchers.IO) {
+                            player.setDataSource(path)
+                            player.prepare()
                         }
-                        if (!player.isPlaying) player.start()
-                        active.add(player to clip)
+                        val early = cueMs - (SystemClock.elapsedRealtime() - startedAt)
+                        if (early > 0L) {
+                            // Ready ahead of time: line up on the clip's first frame and wait.
+                            seek(player, clip.trimIn)
+                            delay(early)
+                        }
+                        // Where the playhead is inside the clip by now.
+                        val localSec = ((SystemClock.elapsedRealtime() - startedAt - cueMs) / 1000.0).coerceAtLeast(0.0)
+                        if (localSec < rc.duration) {
+                            if (early <= 0L) seek(player, clip.trimIn + localSec * speed)
+                            applyVolume(player, clip, localSec, rc.duration)
+                            if (speed != 1.0) {
+                                // Setting playback params also starts the player on most devices.
+                                runCatching { player.playbackParams = PlaybackParams().setSpeed(speed.toFloat()) }
+                            }
+                            if (!player.isPlaying) player.start()
+                            active.add(player to clip)
+                            handedOver = true
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
-                        release(player)
+                        // A file the player refuses is simply not heard.
+                    } finally {
+                        // Stopped while it was still opening, or failed: nothing else owns it.
+                        if (!handedOver) release(player)
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Moves a player to an exact source time. The plain `seekTo` lands on the previous video key
+     * frame, which for the sound of a video clip can be a second or more early; the picture is
+     * frame-accurate, so the sound has to be as well.
+     */
+    private fun seek(player: MediaPlayer, sourceSec: Double) {
+        player.seekTo((sourceSec * 1000.0).toLong().coerceAtLeast(0L), MediaPlayer.SEEK_CLOSEST)
     }
 
     /**
@@ -123,5 +162,10 @@ class PreviewAudioEngine {
         runCatching { if (player.isPlaying) player.stop() }
         runCatching { player.reset() }
         runCatching { player.release() }
+    }
+
+    private companion object {
+        /** How long before its cue a clip's file is opened. */
+        const val OPEN_AHEAD_MS = 600L
     }
 }

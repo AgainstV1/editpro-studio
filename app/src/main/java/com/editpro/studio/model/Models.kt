@@ -557,8 +557,18 @@ object TimelineEngine {
      * Computes piecewise-linear volume automation gain [0.0 .. 2.0] at `localTimeSec`.
      */
     fun automationGain(clip: TimelineClip, localTimeSec: Double): Double {
-        val pts = clip.volumeKeyframes.sortedBy { it.time }
-        if (pts.isEmpty()) return 1.0
+        val stored = clip.volumeKeyframes
+        if (stored.isEmpty()) return 1.0
+        // The export asks for this once per audio sample, so the points are only sorted (which
+        // copies the list) when they are not already in order.
+        var inOrder = true
+        for (i in 1 until stored.size) {
+            if (stored[i].time < stored[i - 1].time) {
+                inOrder = false
+                break
+            }
+        }
+        val pts = if (inOrder) stored else stored.sortedBy { it.time }
         val t = max(0.0, localTimeSec)
         if (t <= pts.first().time) return (pts.first().value / 100.0).coerceIn(0.0, 2.0)
         if (t >= pts.last().time) return (pts.last().value / 100.0).coerceIn(0.0, 2.0)

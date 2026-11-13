@@ -69,6 +69,13 @@ action can be rebound.
   picture and audio tracks, and picture tracks have their own mute and solo.
 - **Export audio is processed**: the five-band EQ, the compressor, pan and a soft limiter are now
   applied. De-essing and reverb still are not; see `docs/MAINTENANCE.md`.
+- **Export audio is mixed as a stream**, about a tenth of a second at a time, instead of being
+  decoded and mixed whole in memory. The five-minute limit on a render's sound is gone (the
+  ceiling is now an hour), and a long clip no longer risks running the tablet out of memory.
+- **A render says when sound is missing.** If a clip's audio cannot be read, or the mix fails
+  altogether, the picture still exports and the result names what is missing, instead of
+  delivering a silent file as a success. The export sheet shows progress while the sound is
+  mixed, and cancelling works during it.
 - **Edge trims stop at the neighbouring clip**, at the start of the timeline and at the ends of
   the source, and snap to cuts, markers and the playhead.
 - **Timeline zoom** runs from a whole long edit down to a few frames. Ctrl + mouse wheel zooms
@@ -98,6 +105,22 @@ action can be rebound.
 - A long edit at high zoom could ask for a timeline wider than a layout can be.
 - Portrait photos could appear on their side.
 - The MCP server reported a fixed, out-of-date version number.
+- Exports longer than five minutes went silent after the five-minute mark.
+- Surround (5.1 / 7.1) audio was read as if it were stereo, which scrambled it in the export. It
+  is now folded down to stereo with the dialogue channel kept.
+- 24-bit and floating-point audio files could be read as 16-bit, which turns them into noise.
+- In the preview, the sound of a video clip started from the key frame before the playhead, up
+  to a second or more early. It now starts from the exact position, like the picture.
+- Pressing play froze the editor while each sound file was opened. Files are now opened in the
+  background, shortly before their clip is due.
+- A stutter in the interface during playback left the picture behind the sound for the rest of
+  the take.
+- Playback carried on, audibly, after leaving the app.
+- A cancelled or failed export left a broken file in the exports folder, had already deleted the
+  previous render of the same project, and kept the video encoder open. A render is now written
+  beside its final name and moved into place only when it is whole.
+- An export whose file could not be finished (a full disk, or an encoder that produced nothing)
+  was reported as a success.
 
 ## 2.9.0 — unreleased
 

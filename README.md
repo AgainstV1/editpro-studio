@@ -57,7 +57,9 @@ whose text and colours are edited in the inspector.
 **Audio**
 Video clips carry their own sound, which can be detached onto an audio track. Volume, fades and
 volume automation apply to preview and export; the five-band EQ, compressor and pan are applied to
-the export (the preview applies pan only). De-essing and reverb are not processed yet — see
+the export (the preview applies pan only). The export mixes mono, stereo and surround sources into
+one stereo track, streaming them so a long edit keeps its sound to the end, and says so if a
+clip's audio could not be read. De-essing and reverb are not processed yet — see
 [docs/MAINTENANCE.md](docs/MAINTENANCE.md).
 
 **Export**
@@ -115,7 +117,8 @@ app/src/main/java/com/editpro/studio/
 ├── viewmodel/          Single source of truth (EditorUiState) and every editing operation
 ├── model/              Data types and the pure logic: timeline engine and edits (TimelineOps),
 │                       keyframes (KeyframeOps), key map (Shortcuts), motion-graphics timing,
-│                       audio DSP, project storage (ProjectStore) and serialisation
+│                       audio DSP and the clip mixer, project storage (ProjectStore) and
+│                       serialisation
 ├── media/              Media import, the frame compositor shared by preview and export,
 │                       the title / motion-graphics renderer, preview audio, MediaCodec export
 ├── agent/, mcp/        The built-in assistant and the MCP server, over one shared tool layer
@@ -133,9 +136,9 @@ apart.
 Actively used, but early. Worth knowing before relying on it:
 
 - **Verification is compile-time.** CI runs the JVM unit tests (timeline engine and edits,
-  keyframes, key map, project storage, serialisation, audio maths) and builds the APKs. There are
-  **no instrumentation tests**, so UI, media and file-system behaviour is verified by hand against
-  a written checklist.
+  keyframes, key map, project storage, serialisation, and the export's audio mix, which is also
+  run against stand-in codecs) and builds the APKs. There are **no instrumentation tests**, so
+  UI, media and file-system behaviour is verified by hand against a written checklist.
 - **Video preview is frame-accurate, not real-time.** Frames come from Android's
   `MediaMetadataRetriever`, which is exact but slow, so video plays back in the preview at a
   reduced frame rate while the sound runs at full speed. The export is unaffected.

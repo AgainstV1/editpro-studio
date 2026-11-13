@@ -2319,7 +2319,10 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
             while (isActive && _uiState.value.isPlaying) {
                 delay(16L) // ~60fps frame ticker
                 val now = System.currentTimeMillis()
-                val dt = ((now - lastMs) / 1000.0).coerceIn(0.0, 0.1)
+                // The sound runs on the real clock, so the playhead has to keep up with it: a
+                // tick that arrives late moves the playhead by the time that really passed.
+                // The ceiling only guards against a clock jump or a long freeze.
+                val dt = ((now - lastMs) / 1000.0).coerceIn(0.0, 0.5)
                 lastMs = now
                 val cur = _uiState.value
                 tick++
@@ -3012,6 +3015,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                 val s = _uiState.value
                 var succeeded = 0
                 var failed = 0
+                var soundTrouble = 0
                 var lastPath: String? = null
                 for ((index, job) in queue.withIndex()) {
                     val result = NativeVideoExporter.exportProjectToMp4(
@@ -3032,6 +3036,7 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                     )
                     if (result.success) {
                         succeeded++
+                        if (result.soundNote != null) soundTrouble++
                         lastPath = result.outputFile?.absolutePath
                         result.outputFile?.let { f ->
                             withContext(Dispatchers.IO) {
@@ -3042,7 +3047,8 @@ class EditProViewModel(application: Application) : AndroidViewModel(application)
                         failed++
                     }
                 }
-                val summary = "Render queue finished: $succeeded succeeded, $failed failed."
+                val summary = "Render queue finished: $succeeded succeeded, $failed failed." +
+                    if (soundTrouble > 0) " Sound is missing or incomplete in $soundTrouble of them." else ""
                 _uiState.update {
                     it.copy(
                         isExporting = false,

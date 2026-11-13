@@ -51,7 +51,9 @@ fun interface VideoFrameSource {
 data class ExportResult(
     val success: Boolean,
     val outputFile: File? = null,
-    val message: String
+    val message: String,
+    /** Set when the file was written but some or all of its sound is missing; says what. */
+    val soundNote: String? = null
 )
 
 object NativeVideoExporter {
@@ -106,13 +108,44 @@ object NativeVideoExporter {
         val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
         val safeTitle = projectName.replace(Regex("[^a-zA-Z0-9_-]+"), "_").take(50).ifEmpty { "EditPro_Project" }
         val outputFile = File(exportDir, "${safeTitle}_AndroidTurbo.mp4")
-        if (outputFile.exists()) outputFile.delete()
+        // The render is written beside its final name and moved there only once it is whole, so
+        // a cancelled or failed render neither leaves a file no player can open nor costs the
+        // previous render of the same project. Anything a killed render left behind goes first.
+        val partFile = File(exportDir, "${outputFile.name}.part")
+        runCatching {
+            exportDir.listFiles { f -> f.isFile && f.name.endsWith(".part") }?.forEach { it.delete() }
+        }
 
         onProgress(2, "Initializing Android Hardware H.264 encoder (${width}×${height} @ ${fps}fps)…")
 
         // Preload image bitmaps and open MediaMetadataRetrievers for video clips
         val bitmapCache = mutableMapOf<String, Bitmap>()
         val videoRetrievers = mutableMapOf<String, MediaMetadataRetriever>()
+
+        // Whatever the render opens is noted here and closed by closeRender(), on the way out
+        // as much as at the end: a cancelled or failed render must not keep a hardware encoder,
+        // an open file and a frame-sized bitmap until the garbage collector happens by.
+        var openEncoder: MediaCodec? = null
+        var openMuxer: MediaMuxer? = null
+        var openFrame: Bitmap? = null
+        var completed = false
+
+        fun closeRender() {
+            openFrame?.let { if (!it.isRecycled) it.recycle() }
+            openFrame = null
+            openEncoder?.let { codec ->
+                try { codec.stop() } catch (_: Exception) {}
+                try { codec.release() } catch (_: Exception) {}
+            }
+            openEncoder = null
+            openMuxer?.let { writer ->
+                // Only reached with the muxer still running when the render is being given
+                // up, so it does not matter whether stop() manages to finish the file.
+                try { writer.stop() } catch (_: Exception) {}
+                try { writer.release() } catch (_: Exception) {}
+            }
+            openMuxer = null
+        }
 
         try {
             for (rc in visibleVisuals) {
@@ -132,14 +165,27 @@ object NativeVideoExporter {
                 }
             }
 
-            // Mix and encode the timeline's audio into an AAC track. Deliberately wrapped: if
-            // anything in the audio path fails, the video must still export (just silent).
-            val encodedAudio = try {
-                TimelineAudioEncoder.encode(started, assetsById, trackStates, fromSec, toSec)
+            // Mix and encode the timeline's sound into an AAC track. Deliberately wrapped: if
+            // anything in the audio path fails the picture must still export, and the result
+            // says that the sound is missing rather than let a silent file look like a success.
+            val audioOutcome = try {
+                TimelineAudioEncoder.encode(started, assetsById, trackStates, fromSec, toSec) { done ->
+                    // A long timeline takes a while to mix, so it reports and can be cancelled.
+                    coroutineContext.ensureActive()
+                    onProgress(2, "Mixing the sound… ${(done * 100f).roundToInt()}%")
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (_: Exception) {
-                null
+                TimelineAudioEncoder.Outcome(null, failed = true)
+            } catch (_: OutOfMemoryError) {
+                TimelineAudioEncoder.Outcome(null, failed = true)
             }
-            if (encodedAudio != null) {
+            val encodedAudio = audioOutcome.audio
+            val audioNote = audioOutcome.note()
+            if (audioNote != null) {
+                onProgress(3, "Sound: $audioNote.")
+            } else if (encodedAudio != null) {
                 onProgress(3, "Audio mixed and encoded (AAC · stereo · 44.1 kHz).")
             }
 
@@ -151,30 +197,37 @@ object NativeVideoExporter {
             }
 
             val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            openEncoder = encoder
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
 
-            val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val muxer = MediaMuxer(partFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            openMuxer = muxer
             var trackIndex = -1
             var audioTrackIndex = -1
             var muxerStarted = false
             val bufferInfo = MediaCodec.BufferInfo()
 
             val frameBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            openFrame = frameBitmap
             val frameCanvas = Canvas(frameBitmap)
             val argbPixels = IntArray(width * height)
             val yuvBuffer = ByteArray(width * height * 3 / 2)
 
             fun drainEncoder(endOfStream: Boolean) {
-                if (endOfStream) {
-                    try {
+                var endQueued = !endOfStream
+                while (true) {
+                    // Waiting for the tail has no fixed length, so it can be cancelled.
+                    if (endOfStream) coroutineContext.ensureActive()
+                    if (!endQueued) {
+                        // If the encoder has no room for the end marker it is offered again
+                        // next time round: without it the tail never comes.
                         val inIdx = encoder.dequeueInputBuffer(10_000L)
                         if (inIdx >= 0) {
                             encoder.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            endQueued = true
                         }
-                    } catch (_: Exception) {}
-                }
-                while (true) {
+                    }
                     val outIdx = encoder.dequeueOutputBuffer(bufferInfo, 10_000L)
                     if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) {
                         if (!endOfStream) break
@@ -253,14 +306,20 @@ object NativeVideoExporter {
             }
 
             drainEncoder(endOfStream = true)
-            frameBitmap.recycle()
-
-            try { encoder.stop() } catch (_: Exception) {}
-            try { encoder.release() } catch (_: Exception) {}
-            if (muxerStarted) {
-                try { muxer.stop() } catch (_: Exception) {}
+            if (!muxerStarted) throw IllegalStateException("the video encoder produced no picture")
+            // Stopping the muxer writes the index that makes the file playable. If that fails
+            // the render has failed, however far it got; a full disk is the usual reason.
+            try {
+                muxer.stop()
+            } catch (e: Exception) {
+                throw IllegalStateException("the file could not be finished (is the device out of space?)", e)
             }
-            try { muxer.release() } catch (_: Exception) {}
+            closeRender()
+            if (!partFile.renameTo(outputFile)) {
+                outputFile.delete()
+                if (!partFile.renameTo(outputFile)) throw IllegalStateException("the finished file could not be saved")
+            }
+            completed = true
 
             // Keep the exports folder bounded — retain only the newest renders.
             runCatching {
@@ -275,7 +334,9 @@ object NativeVideoExporter {
             ExportResult(
                 success = true,
                 outputFile = outputFile,
-                message = "Exported ${outputFile.name} ($sizeKb KB)"
+                message = "Exported ${outputFile.name} ($sizeKb KB)" +
+                    (audioNote?.let { " — $it." } ?: ""),
+                soundNote = audioNote
             )
         } catch (e: kotlinx.coroutines.CancellationException) {
             // Cooperative cancellation must propagate, not be reported as a render failure.
@@ -286,6 +347,8 @@ object NativeVideoExporter {
                 message = "Export failed: ${e.message ?: e.javaClass.simpleName}"
             )
         } finally {
+            closeRender()
+            if (!completed) runCatching { partFile.delete() }
             bitmapCache.values.forEach { it.recycle() }
             videoRetrievers.values.forEach { try { it.release() } catch (_: Exception) {} }
         }

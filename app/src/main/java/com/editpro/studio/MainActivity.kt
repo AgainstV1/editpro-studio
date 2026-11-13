@@ -164,6 +164,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        // The editor is no longer on screen. Playback would otherwise carry on and be heard
+        // from behind the home screen or another app; a rotation is not leaving.
+        if (!isChangingConfigurations) runCatching { viewModel.pausePlayback() }
         // Leaving the app is when work is most likely to be lost, so it is written now rather
         // than left to the debounced autosave.
         runCatching { viewModel.saveProjectQuietly() }
